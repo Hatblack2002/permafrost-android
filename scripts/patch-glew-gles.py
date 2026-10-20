@@ -61,6 +61,15 @@ for target_dir in targets:
         print(f"Installed {pf_gl_dst}")
 print(f"Rewrote GLEW includes in {rewritten} files")
 
+# The loop above only sees directories that still contain files with the
+# raw GLEW include. Once the rewrite is committed (rewritten == 0), the
+# previously installed copies must still track android/include/pf_gl.h,
+# so refresh every copy already living under the engine source tree.
+for pf_gl_dst in sorted((source / "src").rglob("pf_gl.h")):
+    if pf_gl_dst.read_text() != header:
+        pf_gl_dst.write_text(header)
+        print(f"Refreshed {pf_gl_dst}")
+
 # ----------------------------------------------------------- 3-5. render.c
 render_c = source / "src" / "render" / "render.c"
 text = render_c.read_text()

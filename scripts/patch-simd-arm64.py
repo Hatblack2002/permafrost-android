@@ -1,24 +1,31 @@
 #!/usr/bin/env python3
-"""Port the SIMD-specialized bitmap grid to AArch64 (Android arm64-v8a).
+"""Port the SIMD-specialized code paths to AArch64 (Android arm64-v8a).
 
-Two transformations (idempotent, anchor-checked; x86 output unchanged):
+Idempotent, anchor-checked; x86 expansions unchanged.
 
   1. engine/src/lib/public/simd.h: SIMD_TARGET_AVX2/AVX512F and the
      __builtin_cpu_* feature detection are x86-only. Gate them on
-     __x86_64__/__i386__ so non-x86 targets get the behavior the file
-     already documents ("other compilers / non-x86: scalar only,
-     simd_avx2_supported() returns 0") instead of a broken build.
+     __x86_64__/__i386__ so non-x86 targets get the documented behavior
+     ("other compilers / non-x86: scalar only, simd_avx2_supported()
+     returns 0") instead of a broken build.
 
-  2. engine/src/lib/public/bitmap_grid.h: the AVX2/AVX-512 scanner
-     definitions and their dispatch arms live inside the single
+  2. engine/src/lib/public/bitmap_grid.h: the AVX2 LUT, the AVX2/AVX-512
+     scanner definitions and their dispatch arms live inside the single
      BITMAP_GRID_IMPL macro and compile unconditionally, which cannot
      work where <immintrin.h> does not exist (aarch64). C does not allow
-     #if inside a macro definition (GCC: "'#' is not followed by a macro
-     parameter"), so the SIMD paths move into _BG_AVX2_FUNCS /
-     _BG_AVX512_FUNCS sub-macros whose definitions are selected at
-     include time, and the runtime dispatch goes through
-     _BG_AVX2_DISPATCH / _BG_AVX512_DISPATCH. On x86 the expansion is
-     identical to before; on aarch64 only the scalar paths compile.
+     #if inside a macro definition, so they move into _BG_AVX2_LUT,
+     _BG_AVX2_FUNCS and _BG_AVX512_FUNCS sub-macros whose definitions
+     are selected at include time; the runtime dispatch goes through
+     _BG_AVX2_DISPATCH / _BG_AVX512_DISPATCH. The x86-only
+     _mm_prefetch(..., _MM_HINT_T0) hints become portable
+     __builtin_prefetch(ptr, 0, 3) calls (same semantics on both ISAs).
+
+  3. engine/src/game/movement.c, clearpath.c and fog_of_war.c carry
+     their own AVX2/AVX-512 kernels (flock cohesion, point-in-convex-
+     region, fog stamping). These are plain functions, so plain
+     #if SIMD_HAS_TARGET_AVX2 / SIMD_HAS_TARGET_AVX512F guards compile
+     them out on aarch64; the dispatch sites are guarded the same way
+     and the dispatch pointers keep their scalar default initializers.
 
 Applied by .github/workflows/apply-android-port-patches.yml and
 .github/workflows/android-engine-compile-report.yml before ndk-build.
@@ -88,66 +95,57 @@ print(f"Patched {simd_h} (x86-only gates)")
 bg_h = source / "src" / "lib" / "public" / "bitmap_grid.h"
 text = bg_h.read_text()
 
-if "_BG_AVX2_FUNCS" in text:
-    print(f"{bg_h}: SIMD sub-macros already applied")
-    sys.exit(0)
+if "_BG_AVX2_FUNCS" not in text:
+    lines = text.split("\n")
 
-lines = text.split("\n")
+    def find(needle, start=0, what=""):
+        for i in range(start, len(lines)):
+            if needle in lines[i]:
+                return i
+        raise SystemExit(f"bitmap_grid.h: anchor not found: {what or needle}")
 
+    a_sec2 = find("Section 2: AVX2 compress-store LUT", what="section 2 comment")
+    a_sec3 = find("Section 3: Per-cell scan functions", what="section 3 comment")
+    a_avx512c = find("-- AVX-512 scanners --", what="avx512 comment")
+    a_sec4 = find("Section 4: Runtime SIMD dispatch", what="section 4 comment")
+    a_impl = find("#define BITMAP_GRID_IMPL(scope, name, type)",
+                  what="BITMAP_GRID_IMPL definition")
 
-def find(needle, start=0, what=""):
-    for i in range(start, len(lines)):
-        if needle in lines[i]:
-            return i
-    raise SystemExit(f"bitmap_grid.h: anchor not found: {what or needle}")
+    # 0-based, inclusive region bounds (all inside the big macro):
+    #   lut   [a_sec2-1 .. a_sec3-2]  Section 2 comment + perm8 LUT + init
+    #   scan  [a_rect .. a_avx512c-2] AVX2 rect/circle scanners
+    #   avx512[a_avx512c .. a_sec4-3] AVX-512 rect/circle scanners
+    # The per-cell scalar functions (Section 3) are NOT touched: they are
+    # the fallback every target compiles.
+    lut_start, lut_end = a_sec2 - 1, a_sec3 - 2
+    scan_start = find("SIMD_TARGET_AVX2", a_sec3,
+                      what="first AVX2 scanner")          # SIMD_TARGET_AVX2 line
+    scan_end = a_avx512c - 2
+    avx512_start = a_avx512c
+    avx512_end = a_sec4 - 3
 
+    for idx, expect in ((lut_start, "/*"), (scan_start, "SIMD_TARGET_AVX2"),
+                        (scan_end, "}"), (avx512_start, "/*"),
+                        (avx512_end, "}")):
+        stripped = lines[idx].strip()
+        if not stripped.startswith(expect):
+            raise SystemExit(f"bitmap_grid.h: boundary check failed at line "
+                             f"{idx + 1}: expected {expect!r}, got "
+                             f"{stripped[:40]!r}")
 
-a_sec2 = find("Section 2: AVX2 compress-store LUT", what="section 2 comment")
-a_avx512c = find("-- AVX-512 scanners --", what="avx512 comment")
-a_sec4 = find("Section 4: Runtime SIMD dispatch", what="section 4 comment")
-a_impl = find("#define BITMAP_GRID_IMPL(scope, name, type)",
-              what="BITMAP_GRID_IMPL definition")
-
-# Region 1 (1-based inclusive): LUT + AVX2 rect/circle scanners,
-# from the '====== ' comment line above the Section 2 header through the
-# closing brace of _scan_circle_avx2 (the blank continuation line before
-# the AVX-512 comment is dropped).
-r1_start = a_sec2 - 1        # 0-based index of the '/* ====== */' line
-r1_end = a_avx512c - 2       # 0-based index of _scan_circle_avx2's closing '}'
-# Region 2: the AVX-512 scanners, comment header through closing brace.
-r2_start = a_avx512c         # 0-based index of the '/* -- AVX-512 scanners --' line
-r2_end = a_sec4 - 3          # 0-based index of _scan_circle_avx512's closing '}'
-
-for idx, expect in ((r1_start, "/*"), (r1_end, "}"),
-                    (r2_start, "/*"), (r2_end, "}")):
-    stripped = lines[idx].strip()
-    if not stripped.startswith(expect):
-        raise SystemExit(f"bitmap_grid.h: boundary check failed at line {idx + 1}: "
-                         f"expected {expect!r}, got {stripped[:40]!r}")
-
-
-def macro_lines(region, last_line_stripped=True):
-    """Normalize an extracted region into sub-macro body lines.
-
-    Every line inside BITMAP_GRID_IMPL ends with a backslash; the final
-    line of a macro definition must not, so the region's closing
-    backslash is dropped (it terminates the sub-macro).
-    """
-    out = list(lines[region[0]:region[1] + 1])
-    if last_line_stripped:
+    def region_lines(start, end):
+        out = list(lines[start:end + 1])
         if not out[-1].rstrip().endswith("\\"):
             raise SystemExit("bitmap_grid.h: extracted region does not end "
                              "with a continuation backslash")
-        out[-1] = out[-1].rstrip()[:-1].rstrip()
-    return out
+        out[-1] = out[-1].rstrip()[:-1].rstrip()  # terminate the sub-macro
+        return out
 
+    lut_body = region_lines(lut_start, lut_end)
+    scan_body = region_lines(scan_start, scan_end)
+    avx512_body = region_lines(avx512_start, avx512_end)
 
-avx2_body = macro_lines((r1_start, r1_end))
-avx512_body = macro_lines((r2_start, r2_end))
-
-# Dispatch arms. The x86 arms reproduce the original if/else blocks; the
-# non-x86 arms assign the scalar entry points unconditionally.
-avx2_dispatch = """    if(SIMD_HAS_TARGET_AVX2 && simd_avx2_supported()) {                                    \\
+    avx2_dispatch = """    if(SIMD_HAS_TARGET_AVX2 && simd_avx2_supported()) {                                    \\
         _bg_##name##_init_perm8_lut();                                                     \\
         _bg_##name##_scan_rect   = _bg_##name##_scan_rect_avx2;                            \\
         _bg_##name##_scan_circle = _bg_##name##_scan_circle_avx2;                          \\
@@ -156,7 +154,7 @@ avx2_dispatch = """    if(SIMD_HAS_TARGET_AVX2 && simd_avx2_supported()) {      
         _bg_##name##_scan_circle = _bg_##name##_scan_circle_scalar;                        \\
     }"""
 
-avx512_dispatch = """    if(SIMD_HAS_TARGET_AVX512F && simd_avx512_supported()) {                               \\
+    avx512_dispatch = """    if(SIMD_HAS_TARGET_AVX512F && simd_avx512_supported()) {                               \\
         _bg_##name##_scan_rect_long   = _bg_##name##_scan_rect_avx512;                     \\
         _bg_##name##_scan_circle_long = _bg_##name##_scan_circle_avx512;                   \\
     }else{                                                                                 \\
@@ -164,53 +162,61 @@ avx512_dispatch = """    if(SIMD_HAS_TARGET_AVX512F && simd_avx512_supported()) 
         _bg_##name##_scan_circle_long = _bg_##name##_scan_circle;                          \\
     }"""
 
-scalar_dispatch_avx2 = """    _bg_##name##_scan_rect   = _bg_##name##_scan_rect_scalar;                              \\
+    scalar_dispatch_avx2 = """    _bg_##name##_scan_rect   = _bg_##name##_scan_rect_scalar;                              \\
     _bg_##name##_scan_circle = _bg_##name##_scan_circle_scalar;"""
 
-scalar_dispatch_avx512 = """    _bg_##name##_scan_rect_long   = _bg_##name##_scan_rect;                                \\
+    scalar_dispatch_avx512 = """    _bg_##name##_scan_rect_long   = _bg_##name##_scan_rect;                                \\
     _bg_##name##_scan_circle_long = _bg_##name##_scan_circle;"""
 
+    def emit_submacro(guard, funcs_name, body, dispatch_name=None,
+                      dispatch_x86=None, dispatch_portable=None):
+        out = [f"#if {guard}"]
+        out.append(f"#define {funcs_name}(name, type)                                            \\")
+        out += body
+        if dispatch_name:
+            out.append(f"#define {dispatch_name}(name)                                                  \\")
+            out += dispatch_x86.split("\n")
+            out.append("#else")
+            out.append(f"#define {funcs_name}(name, type)")
+            out.append(f"#define {dispatch_name}(name)                                                  \\")
+            out += dispatch_portable.split("\n")
+        else:
+            out.append("#else")
+            out.append(f"#define {funcs_name}(name, type)")
+        out.append("#endif")
+        return out
 
-def emit_submacro(guard, funcs_name, dispatch_name, body, dispatch_x86,
-                  dispatch_portable):
-    out = [f"#if {guard}"]
-    out.append(f"#define {funcs_name}(name, type)                                                       \\")
-    out += body
-    out.append(f"#define {dispatch_name}(name)                                                          \\")
-    out += dispatch_x86.split("\n")
-    out.append("#else")
-    out.append(f"#define {funcs_name}(name, type)")
-    out.append(f"#define {dispatch_name}(name)                                                          \\")
-    out += dispatch_portable.split("\n")
-    out.append("#endif")
-    return out
+    submacros = [
+        "/* ====================================================================== */",
+        "/* ISA-conditional scanner specializations.                              */",
+        "/*                                                                       */",
+        "/* BITMAP_GRID_IMPL is a single macro and C does not allow #if inside a  */",
+        "/* macro definition, so the AVX2 LUT and the AVX2/AVX-512 scan paths     */",
+        "/* live in the sub-macros below; their definitions are selected here at  */",
+        "/* include time. On x86 (GCC/Clang) the SIMD paths compile under their   */",
+        "/* per-function target attributes exactly as before. On other targets    */",
+        "/* (aarch64 / Android arm64-v8a) they expand to nothing and the          */",
+        "/* dispatch arms fall back to the scalar scanners, matching the          */",
+        "/* \"scalar-only\" contract documented in simd.h.                          */",
+        "/* ====================================================================== */",
+    ]
+    submacros += emit_submacro("SIMD_HAS_TARGET_AVX2",
+                               "_BG_AVX2_LUT", lut_body)
+    submacros.append("")
+    submacros += emit_submacro("SIMD_HAS_TARGET_AVX2",
+                               "_BG_AVX2_FUNCS", scan_body,
+                               dispatch_name="_BG_AVX2_DISPATCH",
+                               dispatch_x86=avx2_dispatch,
+                               dispatch_portable=scalar_dispatch_avx2)
+    submacros.append("")
+    submacros += emit_submacro("SIMD_HAS_TARGET_AVX512F",
+                               "_BG_AVX512_FUNCS", avx512_body,
+                               dispatch_name="_BG_AVX512_DISPATCH",
+                               dispatch_x86=avx512_dispatch,
+                               dispatch_portable=scalar_dispatch_avx512)
+    submacros.append("")
 
-
-submacros = [
-    "/* ====================================================================== */",
-    "/* ISA-conditional scanner specializations.                              */",
-    "/*                                                                       */",
-    "/* BITMAP_GRID_IMPL is a single macro and C does not allow #if inside a  */",
-    "/* macro definition, so the AVX2/AVX-512 scan paths live in the          */",
-    "/* sub-macros below; their definitions are selected here at include      */",
-    "/* time. On x86 (GCC/Clang) the SIMD paths compile under their           */",
-    "/* per-function target attributes exactly as before. On other targets    */",
-    "/* (aarch64 / Android arm64-v8a) they expand to nothing and the          */",
-    "/* dispatch arms fall back to the scalar scanners, matching the          */",
-    "/* \"scalar-only\" contract documented in simd.h.                          */",
-    "/* ====================================================================== */",
-]
-submacros += emit_submacro("SIMD_HAS_TARGET_AVX2",
-                           "_BG_AVX2_FUNCS", "_BG_AVX2_DISPATCH",
-                           avx2_body, avx2_dispatch, scalar_dispatch_avx2)
-submacros.append("")
-submacros += emit_submacro("SIMD_HAS_TARGET_AVX512F",
-                           "_BG_AVX512_FUNCS", "_BG_AVX512_DISPATCH",
-                           avx512_body, avx512_dispatch,
-                           scalar_dispatch_avx512)
-submacros.append("")
-
-new_init_simd = """    static void _bg_##name##_init_simd(void)                                                   \\
+    new_init_simd = """    static void _bg_##name##_init_simd(void)                                                   \\
     {                                                                                          \\
         if(_bg_##name##_scan_rect != NULL) return;                                             \\
         /* Cell-loop dispatch: AVX2 (with compress-store LUT) when built               */   \\
@@ -222,63 +228,171 @@ new_init_simd = """    static void _bg_##name##_init_simd(void)                 
         _BG_AVX512_DISPATCH(name)                                                              \\
     }                                                                                          \\""".split("\n")
 
-# Locate the init_simd function inside the big macro (4-space closing brace).
-a_init = find("static void _bg_##name##_init_simd(void)",
-              what="init_simd definition")
-i_end = a_init
-while i_end < len(lines):
-    if lines[i_end].startswith("    }") and lines[i_end].rstrip().endswith("\\"):
-        break
-    i_end += 1
+    a_init = find("static void _bg_##name##_init_simd(void)",
+                  what="init_simd definition")
+    i_end = a_init
+    while i_end < len(lines):
+        if lines[i_end].startswith("    }") and lines[i_end].rstrip().endswith("\\"):
+            break
+        i_end += 1
+    else:
+        raise SystemExit("bitmap_grid.h: init_simd closing brace not found")
+
+    lut_invocation = [
+        "    /* AVX2 compress-store LUT (used by the AVX2 rect scanner only):     */   \\",
+        "    /* compiled out on targets without AVX2. See _BG_AVX2_LUT above.     */   \\",
+        "    _BG_AVX2_LUT(name, type)                                                          \\",
+    ]
+    scan_invocation = [
+        "    /* AVX2/AVX-512 scan specializations compile only where the ISA is   */   \\",
+        "    /* available; see the _BG_AVX2_FUNCS / _BG_AVX512_FUNCS definitions  */   \\",
+        "    /* above. On other targets the scalar scanners below are the only    */   \\",
+        "    /* ones.                                                             */   \\",
+        "    _BG_AVX2_FUNCS(name, type)                                                     \\",
+    ]
+    avx512_invocation = [
+        "    _BG_AVX512_FUNCS(name, type)                                                     \\",
+    ]
+
+    new_lines = []
+    for i, line in enumerate(lines):
+        if i == a_impl:
+            new_lines += submacros
+        if i == lut_start:
+            new_lines += lut_invocation
+        if i == scan_start:
+            new_lines += scan_invocation
+        if i == avx512_start:
+            new_lines += avx512_invocation
+        if i == a_init:
+            new_lines += new_init_simd
+        if i in (lut_start, scan_start, avx512_start):
+            continue
+        if lut_start < i <= lut_end:
+            continue
+        if scan_start < i <= scan_end:
+            continue
+        if avx512_start < i <= avx512_end:
+            continue
+        if a_init <= i <= i_end:
+            continue
+        new_lines.append(line)
+
+    text = "\n".join(new_lines)
+
+    # x86-only prefetch intrinsics -> portable builtin (same semantics:
+    # _mm_prefetch(p, _MM_HINT_T0) == __builtin_prefetch(p, 0, 3)).
+    text = text.replace("_mm_prefetch(", "__builtin_prefetch(")
+    text = text.replace("_MM_HINT_T0)", "0, 3)")
+
+    bg_h.write_text(text)
+    print(f"Applied SIMD sub-macro structure to {bg_h}")
 else:
-    raise SystemExit("bitmap_grid.h: init_simd closing brace not found")
+    print(f"{bg_h}: SIMD sub-macros already applied")
 
-# Reassemble: insert sub-macros before BITMAP_GRID_IMPL, drop the two
-# extracted regions (replacing each with an invocation), and swap the
-# init_simd body for the sub-macro dispatch calls.
-avx2_invocation = [
-    "    /* AVX2/AVX-512 scan specializations compile only where the ISA is       */   \\",
-    "    /* available; see the _BG_AVX2_FUNCS / _BG_AVX512_FUNCS definitions       */   \\",
-    "    /* above. On other targets the scalar scanners below are the only ones.  */   \\",
-    "    _BG_AVX2_FUNCS(name, type)                                                     \\",
-]
-avx512_invocation = [
-    "    _BG_AVX512_FUNCS(name, type)                                                     \\",
-]
+# ------------------------------------------- 3. game-file SIMD kernel guards
+def guard_plain_functions(path, close_attr, dispatches):
+    """Wrap plain (non-macro) SIMD kernels in #if guards.
 
-new_lines = []
-for i, line in enumerate(lines):
-    if i == a_impl:
-        new_lines += submacros
-    if i == r2_start:
-        new_lines += avx512_invocation
-    if i == a_init:
-        new_lines += new_init_simd
-        i = i_end  # skip to the end of the original init_simd
-    if r1_start <= i <= r1_end and i == r1_start:
-        new_lines += avx2_invocation
-    if i in (r1_start, r2_start) or (r1_start < i <= r1_end):
-        continue
-    if r2_start < i <= r2_end:
-        continue
-    if a_init < i <= i_end:
-        continue
-    new_lines.append(line)
+    close_attr: the attribute macro whose occurrences start each guarded
+    region; each region ends at the next column-0 closing brace.
+    dispatches: list of (old, new) exact-text replacements for the
+    runtime dispatch statements.
+    """
+    text = path.read_text()
+    if "#if SIMD_HAS_TARGET_AVX2" in text:
+        print(f"{path}: SIMD guards already applied")
+        return
+    lines = text.split("\n")
 
-bg_h.write_text("\n".join(new_lines))
-print(f"Applied SIMD sub-macro structure to {bg_h}")
+    spans = []
+    for attr in close_attr:
+        idxs = [i for i, l in enumerate(lines) if l.strip() == attr]
+        if not idxs:
+            raise SystemExit(f"{path}: no {attr} found")
+        for i_start in idxs:
+            i_end = i_start
+            while i_end < len(lines):
+                if lines[i_end] == "}":
+                    break
+                i_end += 1
+            else:
+                raise SystemExit(f"{path}: closing brace not found after "
+                                 f"line {i_start + 1}")
+            spans.append((i_start, i_end, attr))
 
-# ----------------------------------------------------------------- 3. checks
+    for i_start, i_end, attr in sorted(spans, key=lambda s: s[0], reverse=True):
+        lines.insert(i_end + 1, "#endif")
+        lines.insert(i_start, "#if " + attr)
+    text = "\n".join(lines)
+
+    for old, new in dispatches:
+        text = replace_once(text, old, new, f"{path.name} dispatch")
+    path.write_text(text)
+    print(f"Guarded SIMD kernels in {path}")
+
+
+guard_plain_functions(
+    source / "src" / "game" / "movement.c",
+    ["SIMD_TARGET_AVX2"],
+    [("""    if(simd_avx2_supported()) {
+        s_cohesion_force = cohesion_force_avx2;
+    }
+""",
+      """#if SIMD_HAS_TARGET_AVX2
+    if(simd_avx2_supported()) {
+        s_cohesion_force = cohesion_force_avx2;
+    }
+#endif
+""")])
+
+guard_plain_functions(
+    source / "src" / "game" / "clearpath.c",
+    ["SIMD_TARGET_AVX2"],
+    [("""    if(simd_avx2_supported()) {
+        s_inside_pcr = inside_pcr_avx2;
+    }
+""",
+      """#if SIMD_HAS_TARGET_AVX2
+    if(simd_avx2_supported()) {
+        s_inside_pcr = inside_pcr_avx2;
+    }
+#endif
+""")])
+
+guard_plain_functions(
+    source / "src" / "game" / "fog_of_war.c",
+    ["SIMD_TARGET_AVX2", "SIMD_TARGET_AVX512F"],
+    [("""    s_stamp_row      = simd_avx2_supported()   ? stamp_row_avx2   : stamp_row_scalar;
+    s_stamp_row_long = simd_avx512_supported() ? stamp_row_avx512 : s_stamp_row;
+""",
+      """#if SIMD_HAS_TARGET_AVX2
+    s_stamp_row      = simd_avx2_supported()   ? stamp_row_avx2   : stamp_row_scalar;
+#endif
+#if SIMD_HAS_TARGET_AVX512F
+    s_stamp_row_long = simd_avx512_supported() ? stamp_row_avx512 : s_stamp_row;
+#endif
+""")])
+
+# ----------------------------------------------------------------- 4. checks
 final = bg_h.read_text()
 for marker in ("#if SIMD_HAS_TARGET_AVX2",
+               "#define _BG_AVX2_LUT(name, type)",
                "#define _BG_AVX2_FUNCS(name, type)",
                "_BG_AVX2_DISPATCH(name)",
                "#if SIMD_HAS_TARGET_AVX512F",
                "#define _BG_AVX512_FUNCS(name, type)",
-               "_BG_AVX512_DISPATCH(name)"):
+               "_BG_AVX512_DISPATCH(name)",
+               "__builtin_prefetch("):
     if marker not in final:
         raise SystemExit(f"bitmap_grid.h: post-patch check failed: {marker}")
+if "_mm_prefetch(" in final or "_MM_HINT" in final:
+    raise SystemExit("bitmap_grid.h: x86 prefetch intrinsics remain")
 simd_text = simd_h.read_text()
-if "defined(__x86_64__)" not in simd_text:
+if "(defined(__x86_64__) || defined(__i386__))" not in simd_text:
     raise SystemExit("simd.h: x86 gate missing after patch")
+for name in ("movement.c", "clearpath.c", "fog_of_war.c"):
+    t = (source / "src" / "game" / name).read_text()
+    if "#if SIMD_HAS_TARGET_AVX2" not in t:
+        raise SystemExit(f"{name}: SIMD guard missing after patch")
 print("SIMD AArch64 port verified.")
