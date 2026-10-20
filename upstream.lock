@@ -1,0 +1,3 @@
+UPSTREAM_URL=https://github.com/eduard-permyakov/permafrost-engine.git
+UPSTREAM_REF=083a99cace3eb047e7a3ccb7dc6b22eb78e3967f
+UPSTREAM_VERSION=1.18
