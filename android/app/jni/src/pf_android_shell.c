@@ -18,6 +18,10 @@
  */
 #include <SDL.h>
 #include <GLES3/gl3.h>
+/* ES 3.1 entry points (glDispatchCompute) live in gl31.h on the NDK;
+ * gl3.h only covers ES 3.0. The context itself is still requested as
+ * ES 3.2 below. */
+#include <GLES3/gl31.h>
 
 #include <stdbool.h>
 #include <stdio.h>
