@@ -7,9 +7,7 @@ root = Path(sys.argv[1]) if len(sys.argv) > 1 else Path("engine")
 path = root / "src/cam_control.c"
 s = path.read_text()
 
-anchor = """static void rts_cam_on_mousewheel(void *unused, void *event_arg)
-"""
-insert = """/* Android pinch zoom: SDL reports normalized distance deltas for a two-finger gesture. */
+handler = """/* Android pinch zoom: SDL reports normalized distance deltas for a two-finger gesture. */
 static void rts_cam_on_multigesture(void *unused, void *event_arg)
 {
     struct cam_rts_ctx *ctx = &s_cam_ctx.active_ctx.rts;
@@ -25,36 +23,34 @@ static void rts_cam_on_multigesture(void *unused, void *event_arg)
         ctx->zoom_delta -= 1;
 }
 
-static void rts_cam_on_mousewheel(void *unused, void *event_arg)
 """
+marker = "static void rts_cam_on_mousewheel(void *unused, void *event_arg)"
 if "static void rts_cam_on_multigesture(void *unused, void *event_arg)" not in s:
-    if anchor not in s: raise SystemExit("camera mousewheel anchor missing")
-    s = s.replace(anchor, insert, 1)
+    if marker not in s:
+        raise SystemExit("camera mousewheel anchor missing")
+    s = s.replace(marker, handler + marker, 1)
 
-old = """    E_Global_Register(SDL_MOUSEWHEEL,      rts_cam_on_mousewheel, NULL, G_RUNNING);
-    E_Global_Register(EVENT_UPDATE_END,    rts_cam_on_update_end, NULL, 
-"""
-new = """    E_Global_Register(SDL_MOUSEWHEEL,      rts_cam_on_mousewheel, NULL, G_RUNNING);
-    E_Global_Register(SDL_MULTIGESTURE,    rts_cam_on_multigesture, NULL, G_RUNNING);
-    E_Global_Register(EVENT_UPDATE_END,    rts_cam_on_update_end, NULL, 
-"""
-if new not in s:
-    old2 = """    E_Global_Register(SDL_MOUSEWHEEL,      rts_cam_on_mousewheel, NULL, G_RUNNING);
-    E_Global_Register(EVENT_UPDATE_END,    rts_cam_on_update_end, NULL,
-"""
-    if old2 not in s: raise SystemExit("camera registration anchor missing")
-    s = s.replace(old2, new, 1)
+registration = "E_Global_Register(SDL_MOUSEWHEEL"
+if "E_Global_Register(SDL_MULTIGESTURE,    rts_cam_on_multigesture" not in s:
+    lines = s.splitlines(keepends=True)
+    for i, line in enumerate(lines):
+        if registration in line:
+            lines.insert(i + 1, "    E_Global_Register(SDL_MULTIGESTURE,    rts_cam_on_multigesture, NULL, G_RUNNING);\n")
+            break
+    else:
+        raise SystemExit("camera mousewheel registration missing")
+    s = "".join(lines)
 
-old = """    if(s_cam_ctx.installed_on_mousewheel) E_Global_Unregister(SDL_MOUSEWHEEL,       s_cam_ctx.installed_on_mousewheel);
-    if(s_cam_ctx.installed_on_update_end) E_Global_Unregister(EVENT_UPDATE_END,    s_cam_ctx.installed_on_update_end);
-"""
-new = """    if(s_cam_ctx.installed_on_mousewheel) E_Global_Unregister(SDL_MOUSEWHEEL,       s_cam_ctx.installed_on_mousewheel);
-    E_Global_Unregister(SDL_MULTIGESTURE, rts_cam_on_multigesture);
-    if(s_cam_ctx.installed_on_update_end) E_Global_Unregister(EVENT_UPDATE_END,    s_cam_ctx.installed_on_update_end);
-"""
-if new not in s:
-    if old not in s: raise SystemExit("camera unregister anchor missing")
-    s = s.replace(old, new, 1)
+unregistration = "E_Global_Unregister(SDL_MULTIGESTURE, rts_cam_on_multigesture);"
+if unregistration not in s:
+    lines = s.splitlines(keepends=True)
+    for i, line in enumerate(lines):
+        if "E_Global_Unregister(EVENT_UPDATE_END" in line:
+            lines.insert(i, "    E_Global_Unregister(SDL_MULTIGESTURE, rts_cam_on_multigesture);\n")
+            break
+    else:
+        raise SystemExit("camera update-end unregistration anchor missing")
+    s = "".join(lines)
 
 path.write_text(s)
 print(f"Applied pinch-zoom adaptation to {path}")
