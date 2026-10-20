@@ -94,6 +94,7 @@ cp -r "$REPO_ROOT/engine/deps/Python" "$WORK/py-arm"
         --prefix="$WORK/py-arm-install" \
         --without-threads --without-signal-module --disable-ipv6 \
         ac_cv_file__dev_ptmx=yes ac_cv_file__dev_ptc=no \
+        ac_cv_header_langinfo_h=no \
         PYTHON_FOR_BUILD="$WORK/hostbin/python -E" \
         > cross-configure.log 2>&1 || { tail -n 120 cross-configure.log; exit 1; }
 
