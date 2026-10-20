@@ -152,13 +152,14 @@ CROSS_LIB="$WORK/py-arm/libpython2.7.a"
 # archive's builtin-module table (initmath/initerrno/...), and the
 # library must really be AArch64 (not a stale/host-arch artifact).
 # readelf -h cannot parse the archive's symbol-index member directly,
-# so inspect a real object member instead.
+# so inspect a real object member instead. (grep into a file: see the
+# pipefail note below.)
 GUARD_DIR="$(mktemp -d)"
 ( cd "$GUARD_DIR" \
   && "$CROSS_AR" x "$CROSS_LIB" \
   && FIRST_OBJ="$(ls *.o | sort | head -n1)" \
-  && "$CROSS_READELF" -h "$FIRST_OBJ" | tee "$GUARD_DIR/elf-header.txt" \
-                                  | grep -q "AArch64" ) \
+  && "$CROSS_READELF" -h "$FIRST_OBJ" > "$GUARD_DIR/elf-header.txt" 2>&1 )
+grep -q "AArch64" "$GUARD_DIR/elf-header.txt" \
   || { echo "error: libpython2.7.a is not AArch64" >&2
        cat "$GUARD_DIR/elf-header.txt" 2>/dev/null; exit 1; }
 rm -rf "$GUARD_DIR"
@@ -168,13 +169,19 @@ echo "--- nm init symbols (first 25) ---"
 echo "--- modules actually compiled ---"
 ls -la "$WORK/py-arm"/Modules/*.o 2>/dev/null | head -30 || true
 echo "--- end diagnostics ---"
+# NOTE: the script runs with `set -o pipefail`; `llvm-nm | grep -q` makes
+# nm die of SIGPIPE (grep quits after the match) and the pipeline exits
+# 141, so guards must grep a file, not a pipe.
+NM_OUT="$WORK/libpython-nm.txt"
+"$CROSS_NM" "$CROSS_LIB" > "$NM_OUT" 2>/dev/null || true
+echo "builtin module init functions: $(grep -c ' T init' "$NM_OUT" || true)"
 for sym in initmath initerrno initposix inittime inititertools initoperator init_codecs init_sre; do
-    "$CROSS_NM" "$CROSS_LIB" 2>/dev/null | grep -q "T $sym" || {
+    grep -q "T $sym" "$NM_OUT" || {
         echo "error: builtin module missing from libpython2.7.a: $sym" >&2
         exit 1;
     }
 done
-"$CROSS_NM" "$CROSS_LIB" | grep -c " T init" | xargs echo "builtin module init functions:"
+rm -f "$NM_OUT"
 cp "$CROSS_LIB" "$STAGE/prebuilt/python/libpython2.7.a"
 cp "$WORK/py-arm/pyconfig.h" "$STAGE/prebuilt/python/pyconfig.h"
 
