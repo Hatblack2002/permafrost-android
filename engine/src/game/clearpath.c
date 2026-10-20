@@ -443,7 +443,7 @@ static bool inside_pcr_scalar(const struct rays_soa *soa, vec2_t test)
 /* 8-wide inside_pcr over the SoA rays. The sign tests compare det against
  * EPSILON * |d| like the scalar form, expressed sqrt-free as
  * (det > 0) && (det^2 >= EPS^2 * len2). */
-#if SIMD_TARGET_AVX2
+#if SIMD_HAS_TARGET_AVX2
 SIMD_TARGET_AVX2
 static bool inside_pcr_avx2(const struct rays_soa *soa, vec2_t test)
 {

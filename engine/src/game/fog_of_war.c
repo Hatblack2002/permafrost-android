@@ -265,7 +265,7 @@ static void stamp_row_scalar(uint8_t *rc, uint32_t *fs, int n, int shift,
     }
 }
 
-#if SIMD_TARGET_AVX2
+#if SIMD_HAS_TARGET_AVX2
 SIMD_TARGET_AVX2
 static void stamp_row_avx2(uint8_t *rc, uint32_t *fs, int n, int shift,
                            uint32_t clearmask, int delta)
@@ -290,7 +290,7 @@ static void stamp_row_avx2(uint8_t *rc, uint32_t *fs, int n, int shift,
 }
 #endif
 
-#if SIMD_TARGET_AVX512F
+#if SIMD_HAS_TARGET_AVX512F
 SIMD_TARGET_AVX512F
 static void stamp_row_avx512(uint8_t *rc, uint32_t *fs, int n, int shift,
                              uint32_t clearmask, int delta)

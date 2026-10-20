@@ -3118,7 +3118,7 @@ static vec2_t cohesion_force(uint32_t uid, const struct flock_snap *snap)
 
 /* Cephes-derived polynomial exp over 8 lanes (relative error ~1e-7; the
  * result only weighs flock members in a steering heuristic). */
-#if SIMD_TARGET_AVX2
+#if SIMD_HAS_TARGET_AVX2
 SIMD_TARGET_AVX2
 static inline __m256 exp256_ps(__m256 x)
 {
@@ -3152,7 +3152,7 @@ static inline __m256 exp256_ps(__m256 x)
 }
 #endif
 
-#if SIMD_TARGET_AVX2
+#if SIMD_HAS_TARGET_AVX2
 SIMD_TARGET_AVX2
 static vec2_t cohesion_force_avx2(uint32_t uid, const struct flock_snap *snap)
 {
