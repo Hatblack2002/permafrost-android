@@ -43,6 +43,7 @@ CROSS_CC="$TC/$HOST_TRIPLE$API-clang"
 CROSS_AR="$TC/llvm-ar"
 CROSS_RANLIB="$TC/llvm-ranlib"
 CROSS_READELF="$TC/llvm-readelf"
+CROSS_NM="$TC/llvm-nm"
 
 for tool in "$CROSS_CC" "$CROSS_AR" cmake; do
     [ -x "$tool" ] || command -v "$tool" >/dev/null || {
@@ -61,7 +62,11 @@ cp -r "$REPO_ROOT/engine/deps/Python" "$WORK/py-host"
         > host-configure.log 2>&1 || { tail -n 80 host-configure.log; exit 1; }
     make -j"$JOBS" python Parser/pgen \
         > host-make.log 2>&1 || { tail -n 80 host-make.log; exit 1; }
-    ./python -c 'import sys; assert sys.version_info[:2] == (2, 7), sys.version; print("host python OK:", sys.version)'
+    # -S: skip site.py — a bare `make python` build has no C extension
+    # modules (errno/os live in setup.py-built .so files) and site would
+    # fail on the import chain. The host interpreter is only used for
+    # pgen/autotools chores, never to run the game.
+    ./python -S -c 'import sys; assert sys.version_info[:2] == (2, 7), sys.version; print("host python OK:", sys.version)'
 )
 cp "$WORK/py-host/python" "$WORK/hostbin/python"
 cp "$WORK/py-host/Parser/pgen" "$WORK/hostbin/pgen"
@@ -78,15 +83,54 @@ cp -r "$REPO_ROOT/engine/deps/Python" "$WORK/py-arm"
         ac_cv_file__dev_ptmx=yes ac_cv_file__dev_ptc=no \
         PYTHON_FOR_BUILD="$WORK/hostbin/python -E" \
         > cross-configure.log 2>&1 || { tail -n 120 cross-configure.log; exit 1; }
+
+    # CPython 2.7 builds its C extension modules through setup.py as .so
+    # files by default — impossible here (no on-device interpreter, no
+    # dynamic loading in the embedded lib). Enforce a static set instead:
+    # makesetup folds these into libpython2.7.a and registers them in
+    # _PyImport_Inittab. The set covers every import-time C dependency of
+    # the engine's game scripts (math, itertools, operator, _collections,
+    # _heapq, _bisect, cStringIO, errno, time) plus common extras; the
+    # rest of the game runtime comes from the engine's pure-Python
+    # scripts/stdlib.
+    cat > Modules/Setup.local <<'SETUP'
+# Static modules for the embedded Android interpreter (scripts/build-deps-android.sh)
+errno errnomodule.c
+posix posixmodule.c
+time timemodule.c
+math mathmodule.c
+operator operator.c
+itertools itertoolsmodule.c
+_collections _collectionsmodule.c
+_heapq _heapqmodule.c
+_bisect _bisectmodule.c
+array arraymodule.c
+binascii binascii.c
+_struct _struct.c
+strop stropmodule.c
+cStringIO cStringIO.c
+cPickle cPickle.c
+_random _randommodule.c
+_functools _functoolsmodule.c
+SETUP
+
     make -j"$JOBS" libpython2.7.a PGEN="$WORK/hostbin/pgen" \
         > cross-make.log 2>&1 || { tail -n 120 cross-make.log; exit 1; }
 )
 CROSS_LIB="$WORK/py-arm/libpython2.7.a"
 [ -f "$CROSS_LIB" ] || { echo "error: libpython2.7.a not produced" >&2; exit 1; }
-# Guard against a stale/host-arch library sneaking through.
-file "$CROSS_LIB" | tee "$STAGE/prebuilt/python/libpython2.7.a.filetype"
+# Guard: the statically-enabled module set must have made it into the
+# archive's builtin-module table (initmath/initerrno/...), and the
+# library must really be AArch64 (not a stale/host-arch artifact).
 "$CROSS_READELF" -h "$CROSS_LIB" | grep -q "AArch64" || {
     echo "error: libpython2.7.a is not AArch64" >&2; exit 1; }
+for sym in initmath initerrno initposix inittime inititertools initoperator; do
+    "$CROSS_NM" "$CROSS_LIB" 2>/dev/null | grep -q "T $sym" || {
+        echo "error: builtin module missing from libpython2.7.a: $sym" >&2
+        exit 1;
+    }
+done
+"$CROSS_NM" "$CROSS_LIB" | grep -c " T init" | xargs echo "builtin module init functions:"
 cp "$CROSS_LIB" "$STAGE/prebuilt/python/libpython2.7.a"
 cp "$WORK/py-arm/pyconfig.h" "$STAGE/prebuilt/python/pyconfig.h"
 
