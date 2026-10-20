@@ -1,0 +1,5 @@
+// Permafrost Android — root build script.
+// The Android Gradle Plugin version is pinned here; modules apply it by id.
+plugins {
+    id 'com.android.application' version '8.5.2' apply false
+}
