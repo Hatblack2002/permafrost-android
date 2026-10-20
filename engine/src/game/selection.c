@@ -151,6 +151,55 @@ static void on_mousedown(void *user, void *event)
     s_ctx.mouse_down_coord = (vec2_t){mouse_event->x, mouse_event->y};
 }
 
+/* Touch coordinates are in drawable pixels, matching the existing mouse path. */
+static int s_touch_sel_x;
+static int s_touch_sel_y;
+static bool s_touch_sel_active;
+
+static void on_touch_selection(void *user, void *event)
+{
+    SDL_Event *e = (SDL_Event*)event;
+    int w, h;
+    Engine_WinDrawableSize(&w, &h);
+    if(w <= 0 || h <= 0)
+        return;
+
+    int x = (int)(e->tfinger.x * w);
+    int y = (int)(e->tfinger.y * h);
+    switch(e->type) {
+    case SDL_FINGERDOWN:
+        if(G_MouseOverMinimap() || S_UI_MouseOverWindow(x, y)
+        || G_MouseInTargetMode() || G_Move_InOrderDrag())
+            return;
+        if(x <= 0 || x >= w-1 || y <= 0 || y >= h-1)
+            return;
+        s_touch_sel_x = x;
+        s_touch_sel_y = y;
+        s_touch_sel_active = true;
+        s_ctx.state = STATE_MOUSE_SEL_DOWN;
+        s_ctx.mouse_down_coord = (vec2_t){x, y};
+        break;
+    case SDL_FINGERMOTION:
+        if(s_touch_sel_active) {
+            s_touch_sel_x = x;
+            s_touch_sel_y = y;
+        }
+        break;
+    case SDL_FINGERUP:
+        if(s_touch_sel_active && s_ctx.state == STATE_MOUSE_SEL_DOWN) {
+            s_touch_sel_x = x;
+            s_touch_sel_y = y;
+            s_ctx.state = STATE_MOUSE_SEL_RELEASED;
+            s_ctx.mouse_up_coord = (vec2_t){x, y};
+            s_ctx.num_clicks = 1;
+        }
+        s_touch_sel_active = false;
+        break;
+    default:
+        break;
+    }
+}
+
 static void on_mousemove(void *user, void *event)
 {
     s_hovered_dirty = true;
@@ -173,7 +222,12 @@ static void on_render_ui(void *user, void *event)
         return;
 
     int mouse_x, mouse_y;
-    SDL_GetMouseState(&mouse_x, &mouse_y);
+    if(s_touch_sel_active) {
+        mouse_x = s_touch_sel_x;
+        mouse_y = s_touch_sel_y;
+    } else {
+        SDL_GetMouseState(&mouse_x, &mouse_y);
+    }
 
     vec2_t signed_size = (vec2_t){mouse_x - s_ctx.mouse_down_coord.x, mouse_y - s_ctx.mouse_down_coord.y};
     const float width = 2.0f;
@@ -541,6 +595,9 @@ void G_Sel_Enable(void)
 
     E_Global_Register(SDL_MOUSEBUTTONDOWN, on_mousedown, NULL, G_RUNNING);
     E_Global_Register(SDL_MOUSEBUTTONUP,   on_mouseup, NULL, G_RUNNING);
+    E_Global_Register(SDL_FINGERDOWN,      on_touch_selection, NULL, G_RUNNING);
+    E_Global_Register(SDL_FINGERMOTION,    on_touch_selection, NULL, G_RUNNING);
+    E_Global_Register(SDL_FINGERUP,        on_touch_selection, NULL, G_RUNNING);
     E_Global_Register(EVENT_RENDER_UI,     on_render_ui, NULL, G_RUNNING);
 }
 
@@ -551,8 +608,12 @@ void G_Sel_Disable(void)
     s_ctx.installed = false;
 
     E_Global_Unregister(EVENT_RENDER_UI,     on_render_ui);
+    E_Global_Unregister(SDL_FINGERUP,        on_touch_selection);
+    E_Global_Unregister(SDL_FINGERMOTION,    on_touch_selection);
+    E_Global_Unregister(SDL_FINGERDOWN,      on_touch_selection);
     E_Global_Unregister(SDL_MOUSEBUTTONUP,   on_mouseup);
     E_Global_Unregister(SDL_MOUSEBUTTONDOWN, on_mousedown);
+    s_touch_sel_active = false;
 }
 
 /* Note that the selection is only changed if there is at least one entity in the new selection. Otherwise
