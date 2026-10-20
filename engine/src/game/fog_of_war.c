@@ -265,6 +265,7 @@ static void stamp_row_scalar(uint8_t *rc, uint32_t *fs, int n, int shift,
     }
 }
 
+#if SIMD_TARGET_AVX2
 SIMD_TARGET_AVX2
 static void stamp_row_avx2(uint8_t *rc, uint32_t *fs, int n, int shift,
                            uint32_t clearmask, int delta)
@@ -287,7 +288,9 @@ static void stamp_row_avx2(uint8_t *rc, uint32_t *fs, int n, int shift,
     }
     stamp_row_scalar(rc + i, fs + i, n - i, shift, clearmask, delta);
 }
+#endif
 
+#if SIMD_TARGET_AVX512F
 SIMD_TARGET_AVX512F
 static void stamp_row_avx512(uint8_t *rc, uint32_t *fs, int n, int shift,
                              uint32_t clearmask, int delta)
@@ -322,6 +325,7 @@ static void stamp_row_avx512(uint8_t *rc, uint32_t *fs, int n, int shift,
     }
     stamp_row_scalar(rc + i, fs + i, n - i, shift, clearmask, delta);
 }
+#endif
 
 /* Apply a run of n tiles starting at (abs_r, abs_c). The fog arrays are
  * chunk-blocked, so a run is contiguous only within a chunk -- split it into
@@ -713,8 +717,12 @@ bool G_Fog_Init(const struct map *map)
     s_res = res;
     s_map_pos = M_GetPos(map);
 
+#if SIMD_HAS_TARGET_AVX2
     s_stamp_row      = simd_avx2_supported()   ? stamp_row_avx2   : stamp_row_scalar;
+#endif
+#if SIMD_HAS_TARGET_AVX512F
     s_stamp_row_long = simd_avx512_supported() ? stamp_row_avx512 : s_stamp_row;
+#endif
 
     /* Per-chunk max base height for the open-box fast-path test. Computed from
      * the (static) terrain; kept current by G_Fog_OnTileUpdated on edits. */

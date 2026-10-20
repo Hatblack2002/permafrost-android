@@ -443,6 +443,7 @@ static bool inside_pcr_scalar(const struct rays_soa *soa, vec2_t test)
 /* 8-wide inside_pcr over the SoA rays. The sign tests compare det against
  * EPSILON * |d| like the scalar form, expressed sqrt-free as
  * (det > 0) && (det^2 >= EPS^2 * len2). */
+#if SIMD_TARGET_AVX2
 SIMD_TARGET_AVX2
 static bool inside_pcr_avx2(const struct rays_soa *soa, vec2_t test)
 {
@@ -480,6 +481,7 @@ static bool inside_pcr_avx2(const struct rays_soa *soa, vec2_t test)
     }
     return false;
 }
+#endif
 
 /* Set at init to the widest supported PCR-containment kernel. */
 static bool (*s_inside_pcr)(const struct rays_soa *soa, vec2_t test) = inside_pcr_scalar;
@@ -878,9 +880,11 @@ void G_ClearPath_Init(const struct map *map)
     E_Global_Register(EVENT_RENDER_3D_POST, on_render_3d, (struct map*)map,
         G_RUNNING | G_PAUSED_FULL | G_PAUSED_UI_RUNNING);
     vec_vec2_init(&s_debug_saved.xpoints);
+#if SIMD_HAS_TARGET_AVX2
     if(simd_avx2_supported()) {
         s_inside_pcr = inside_pcr_avx2;
     }
+#endif
 }
 
 void G_ClearPath_Shutdown(void)

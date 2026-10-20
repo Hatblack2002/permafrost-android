@@ -3118,6 +3118,7 @@ static vec2_t cohesion_force(uint32_t uid, const struct flock_snap *snap)
 
 /* Cephes-derived polynomial exp over 8 lanes (relative error ~1e-7; the
  * result only weighs flock members in a steering heuristic). */
+#if SIMD_TARGET_AVX2
 SIMD_TARGET_AVX2
 static inline __m256 exp256_ps(__m256 x)
 {
@@ -3149,7 +3150,9 @@ static inline __m256 exp256_ps(__m256 x)
     emm0 = _mm256_slli_epi32(_mm256_add_epi32(emm0, _mm256_set1_epi32(0x7f)), 23);
     return _mm256_mul_ps(y, _mm256_castsi256_ps(emm0));
 }
+#endif
 
+#if SIMD_TARGET_AVX2
 SIMD_TARGET_AVX2
 static vec2_t cohesion_force_avx2(uint32_t uid, const struct flock_snap *snap)
 {
@@ -3226,6 +3229,7 @@ static vec2_t cohesion_force_avx2(uint32_t uid, const struct flock_snap *snap)
     vec2_truncate(&ret, SCALED_MAX_FORCE);
     return ret;
 }
+#endif
 
 /* Set at init to the widest supported cohesion kernel. */
 static vec2_t (*s_cohesion_force)(uint32_t uid, const struct flock_snap *snap) = cohesion_force;
@@ -8476,9 +8480,11 @@ bool G_Move_NavQuiesce(void)
 bool G_Move_Init(const struct map *map)
 {
     assert(map);
+#if SIMD_HAS_TARGET_AVX2
     if(simd_avx2_supported()) {
         s_cohesion_force = cohesion_force_avx2;
     }
+#endif
     if(NULL == (s_entity_state_table = kh_init(state))) {
         return false;
     }

@@ -121,7 +121,8 @@ static inline unsigned simd_popcount32(unsigned x)
  * equivalent the macro is empty and SIMD_HAS_TARGET_* is 0; callers should
  * gate the wider variant accordingly.
  */
-#if defined(__GNUC__) || defined(__clang__)
+#if (defined(__GNUC__) || defined(__clang__)) \
+    && (defined(__x86_64__) || defined(__i386__))
 #  define SIMD_TARGET_AVX2    __attribute__((target("avx2")))
 #  define SIMD_HAS_TARGET_AVX2 1
 #  define SIMD_TARGET_AVX512F __attribute__((target("avx512f,avx512vl,avx512bw,avx512dq")))
@@ -142,7 +143,8 @@ static inline int simd_avx2_supported(void)
     static int s_cached = -1;
     if(s_cached >= 0)
         return s_cached;
-#if defined(__GNUC__) || defined(__clang__)
+#if (defined(__GNUC__) || defined(__clang__)) \
+    && (defined(__x86_64__) || defined(__i386__))
     __builtin_cpu_init();
     s_cached = __builtin_cpu_supports("avx2") ? 1 : 0;
 #elif defined(_MSC_VER) && (defined(_M_IX86) || defined(_M_X64))
@@ -172,7 +174,8 @@ static inline int simd_avx512_supported(void)
     static int s_cached = -1;
     if(s_cached >= 0)
         return s_cached;
-#if defined(__GNUC__) || defined(__clang__)
+#if (defined(__GNUC__) || defined(__clang__)) \
+    && (defined(__x86_64__) || defined(__i386__))
     __builtin_cpu_init();
     s_cached = (__builtin_cpu_supports("avx512f")
              && __builtin_cpu_supports("avx512bw")
