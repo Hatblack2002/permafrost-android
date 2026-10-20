@@ -1,0 +1,26 @@
+name: Port patch check
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  patch-check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout port workspace
+        uses: actions/checkout@v4
+      - name: Install Git
+        run: git --version
+      - name: Fetch pinned upstream
+        run: bash scripts/prepare-upstream.sh
+      - name: Verify source assumptions and apply Android patches
+        run: |
+          bash scripts/check-upstream.sh
+          bash scripts/apply-port-patches.sh
+      - name: Confirm touch patch changed raycast source
+        run: |
+          grep -q 'SDL_FINGERDOWN' worktree/permafrost-engine/src/map/raycast.c
+          grep -q 's_touch_active' worktree/permafrost-engine/src/map/raycast.c
