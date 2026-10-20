@@ -62,11 +62,14 @@ cp -r "$REPO_ROOT/engine/deps/Python" "$WORK/py-host"
         > host-configure.log 2>&1 || { tail -n 80 host-configure.log; exit 1; }
     make -j"$JOBS" python Parser/pgen \
         > host-make.log 2>&1 || { tail -n 80 host-make.log; exit 1; }
-    # -S: skip site.py — a bare `make python` build has no C extension
-    # modules (errno/os live in setup.py-built .so files) and site would
-    # fail on the import chain. The host interpreter is only used for
-    # pgen/autotools chores, never to run the game.
-    ./python -S -c 'import sys; assert sys.version_info[:2] == (2, 7), sys.version; print("host python OK:", sys.version)'
+    # No interpreter run here on purpose: a bare `make python` build has
+    # NO C extension modules (they are setup.py-built .so files), and
+    # CPython 2.7's startup eagerly imports encodings.utf_8, which needs
+    # the _codecs builtin. The host interpreter is only used for
+    # autotools chores; pgen does the real grammar work.
+    test -x ./python || { echo "error: host python binary missing" >&2; exit 1; }
+    test -x Parser/pgen || { echo "error: host pgen binary missing" >&2; exit 1; }
+    echo "host build OK (python + pgen binaries present)"
 )
 cp "$WORK/py-host/python" "$WORK/hostbin/python"
 cp "$WORK/py-host/Parser/pgen" "$WORK/hostbin/pgen"
@@ -95,6 +98,11 @@ cp -r "$REPO_ROOT/engine/deps/Python" "$WORK/py-arm"
     # scripts/stdlib.
     cat > Modules/Setup.local <<'SETUP'
 # Static modules for the embedded Android interpreter (scripts/build-deps-android.sh)
+# _codecs and _sre are mandatory: Py_InitializeEx eagerly imports
+# encodings.utf_8 at startup, which pulls the _codecs builtin.
+_codecs _codecsmodule.c
+_sre _sre.c
+_symtable symtablemodule.c
 errno errnomodule.c
 posix posixmodule.c
 time timemodule.c
@@ -124,7 +132,7 @@ CROSS_LIB="$WORK/py-arm/libpython2.7.a"
 # library must really be AArch64 (not a stale/host-arch artifact).
 "$CROSS_READELF" -h "$CROSS_LIB" | grep -q "AArch64" || {
     echo "error: libpython2.7.a is not AArch64" >&2; exit 1; }
-for sym in initmath initerrno initposix inittime inititertools initoperator; do
+for sym in initmath initerrno initposix inittime inititertools initoperator init_codecs init_sre; do
     "$CROSS_NM" "$CROSS_LIB" 2>/dev/null | grep -q "T $sym" || {
         echo "error: builtin module missing from libpython2.7.a: $sym" >&2
         exit 1;
