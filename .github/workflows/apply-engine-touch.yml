@@ -5,6 +5,7 @@ on:
   push:
     paths:
       - "scripts/patch-raycast-touch.py"
+      - "scripts/patch-selection-touch.py"
       - ".github/workflows/apply-engine-touch.yml"
 
 permissions:
@@ -22,42 +23,52 @@ jobs:
         run: |
           source upstream.lock
           test -f engine/src/map/raycast.c
-          git -C engine rev-parse --is-inside-work-tree >/dev/null 2>&1 || true
+          test -f engine/src/game/selection.c
           grep -q "$UPSTREAM_REF" engine/UPSTREAM_SOURCE.txt
-      - name: Apply touch raycast adaptation to actual engine source
-        run: python3 scripts/patch-raycast-touch.py engine
-      - name: Verify adaptation anchors and registrations
+      - name: Apply touch adaptations to original engine files
+        run: |
+          python3 scripts/patch-raycast-touch.py engine
+          python3 scripts/patch-selection-touch.py engine
+      - name: Verify touch adaptations and idempotence
         shell: bash
         run: |
+          python3 scripts/patch-raycast-touch.py engine
+          python3 scripts/patch-selection-touch.py engine
           python3 - <<'PY'
           from pathlib import Path
-          p = Path("engine/src/map/raycast.c")
-          s = p.read_text()
-          required = [
-              "static int s_touch_x;",
-              "static bool s_touch_active;",
-              "static void on_touch_pointer(void *user, void *event)",
-              "E_Global_Register(SDL_FINGERDOWN, on_touch_pointer",
-              "E_Global_Register(SDL_FINGERMOTION, on_touch_pointer",
-              "E_Global_Register(SDL_FINGERUP, on_touch_pointer",
-              "E_Global_Unregister(SDL_FINGERDOWN, on_touch_pointer",
-          ]
-          missing = [x for x in required if x not in s]
-          if missing:
-              raise SystemExit("Missing touch adaptation markers: " + repr(missing))
-          if s.count("static void on_touch_pointer(void *user, void *event)") != 1:
-              raise SystemExit("Touch handler duplicated")
-          print("Touch adaptation markers verified.")
+          checks = {
+              "engine/src/map/raycast.c": [
+                  "static void on_touch_pointer(void *user, void *event)",
+                  "E_Global_Register(SDL_FINGERDOWN, on_touch_pointer",
+                  "E_Global_Unregister(SDL_FINGERUP, on_touch_pointer",
+              ],
+              "engine/src/game/selection.c": [
+                  "static void on_touch_selection(void *user, void *event)",
+                  "E_Global_Register(SDL_FINGERDOWN,      on_touch_selection",
+                  "E_Global_Register(SDL_FINGERMOTION,    on_touch_selection",
+                  "E_Global_Register(SDL_FINGERUP,        on_touch_selection",
+                  "E_Global_Unregister(SDL_FINGERDOWN,      on_touch_selection",
+              ],
+          }
+          for filename, markers in checks.items():
+              source = Path(filename).read_text()
+              missing = [m for m in markers if m not in source]
+              if missing:
+                  raise SystemExit(f"{filename}: missing markers {missing}")
+          selection = Path("engine/src/game/selection.c").read_text()
+          if selection.count("static void on_touch_selection(void *user, void *event)") != 1:
+              raise SystemExit("Touch selection handler duplicated")
+          print("Raycast and selection touch markers verified; scripts are idempotent.")
           PY
       - name: Commit adapted original engine source
         shell: bash
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add engine/src/map/raycast.c
+          git add engine/src/map/raycast.c engine/src/game/selection.c
           if git diff --cached --quiet; then
-            echo "Touch adaptation already applied."
+            echo "Touch adaptations already applied."
             exit 0
           fi
-          git commit -m "android: adapt original raycast to SDL touch input [skip ci]"
+          git commit -m "android: adapt raycast and RTS selection to touch [skip ci]"
           git push origin HEAD:main
