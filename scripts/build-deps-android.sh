@@ -79,6 +79,16 @@ cp -r "$REPO_ROOT/engine/deps/Python" "$WORK/py-arm"
 (
     cd "$WORK/py-arm"
     export CC="$CROSS_CC" AR="$CROSS_AR" RANLIB="$CROSS_RANLIB" READELF="$CROSS_READELF"
+
+    # bionic declares `size_t malloc_usable_size(const void*)` in
+    # <malloc.h>; the Permafrost Engine accounting patch in obmalloc.c
+    # redeclares it with `void*`, which clang rejects as a conflicting
+    # type. Use the system declaration instead of the extern.
+    sed -i 's|^extern size_t malloc_usable_size(void \*);$|#include <malloc.h>|' \
+        Objects/obmalloc.c
+    grep -q '#include <malloc.h>' Objects/obmalloc.c || {
+        echo "error: obmalloc.c malloc_usable_size patch did not apply" >&2; exit 1;
+    }
     ./configure \
         --host="$HOST_TRIPLE" --build="$BUILD_TRIPLE" \
         --prefix="$WORK/py-arm-install" \
