@@ -6,6 +6,7 @@ on:
     paths:
       - "scripts/patch-raycast-touch.py"
       - "scripts/patch-selection-touch.py"
+      - "scripts/patch-camera-gesture.py"
       - ".github/workflows/apply-engine-touch.yml"
 
 permissions:
@@ -24,16 +25,19 @@ jobs:
           source upstream.lock
           test -f engine/src/map/raycast.c
           test -f engine/src/game/selection.c
+          test -f engine/src/cam_control.c
           grep -q "$UPSTREAM_REF" engine/UPSTREAM_SOURCE.txt
       - name: Apply touch adaptations to original engine files
         run: |
           python3 scripts/patch-raycast-touch.py engine
           python3 scripts/patch-selection-touch.py engine
+          python3 scripts/patch-camera-gesture.py engine
       - name: Verify touch adaptations and idempotence
         shell: bash
         run: |
           python3 scripts/patch-raycast-touch.py engine
           python3 scripts/patch-selection-touch.py engine
+          python3 scripts/patch-camera-gesture.py engine
           python3 - <<'PY'
           from pathlib import Path
           checks = {
@@ -49,26 +53,34 @@ jobs:
                   "E_Global_Register(SDL_FINGERUP,        on_touch_selection",
                   "E_Global_Unregister(SDL_FINGERDOWN,      on_touch_selection",
               ],
+              "engine/src/cam_control.c": [
+                  "static void rts_cam_on_multigesture(void *unused, void *event_arg)",
+                  "E_Global_Register(SDL_MULTIGESTURE,    rts_cam_on_multigesture",
+                  "E_Global_Unregister(SDL_MULTIGESTURE, rts_cam_on_multigesture)",
+              ],
           }
           for filename, markers in checks.items():
               source = Path(filename).read_text()
               missing = [m for m in markers if m not in source]
               if missing:
                   raise SystemExit(f"{filename}: missing markers {missing}")
-          selection = Path("engine/src/game/selection.c").read_text()
-          if selection.count("static void on_touch_selection(void *user, void *event)") != 1:
-              raise SystemExit("Touch selection handler duplicated")
-          print("Raycast and selection touch markers verified; scripts are idempotent.")
+          for filename, marker in [
+              ("engine/src/game/selection.c", "static void on_touch_selection(void *user, void *event)"),
+              ("engine/src/cam_control.c", "static void rts_cam_on_multigesture(void *unused, void *event_arg)"),
+          ]:
+              if Path(filename).read_text().count(marker) != 1:
+                  raise SystemExit(f"{filename}: handler duplicated")
+          print("Touch raycast, selection, pinch zoom, and patch idempotence verified.")
           PY
       - name: Commit adapted original engine source
         shell: bash
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add engine/src/map/raycast.c engine/src/game/selection.c
+          git add engine/src/map/raycast.c engine/src/game/selection.c engine/src/cam_control.c
           if git diff --cached --quiet; then
             echo "Touch adaptations already applied."
             exit 0
           fi
-          git commit -m "android: adapt raycast and RTS selection to touch [skip ci]"
+          git commit -m "android: add pinch zoom camera gesture [skip ci]"
           git push origin HEAD:main
