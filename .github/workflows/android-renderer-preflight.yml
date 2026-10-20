@@ -1,0 +1,20 @@
+name: Android renderer preflight
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "scripts/audit-android-renderer.py"
+      - "engine/src/render/**"
+      - ".github/workflows/android-renderer-preflight.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  renderer-preflight:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Audit desktop OpenGL dependencies before GLES port
+        run: python3 scripts/audit-android-renderer.py engine
