@@ -1,0 +1,22 @@
+name: Android port batch preflight
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "scripts/audit-android-port.py"
+      - "engine/src/render/**"
+      - "engine/data/shaders/**"
+      - "engine/Makefile"
+      - ".github/workflows/android-port-preflight.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  port-preflight:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Inspect renderer, shaders and native dependencies together
+        run: python3 scripts/audit-android-port.py engine
