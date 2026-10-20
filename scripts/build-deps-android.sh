@@ -138,7 +138,7 @@ SETUP
         > cross-configure.log 2>&1 || { tail -n 120 cross-configure.log; exit 1; }
 
     # Sanity: the final Makefile must carry the static module set.
-    grep -q "Modules/mathmodule.o" Makefile || {
+    grep "^MODOBJS=" Makefile | tee /dev/stderr | grep -q "Modules/mathmodule.o" || {
         echo "error: MODOBJS lacks mathmodule.o — Setup.local not processed" >&2
         exit 1;
     }
@@ -162,6 +162,12 @@ GUARD_DIR="$(mktemp -d)"
   || { echo "error: libpython2.7.a is not AArch64" >&2
        cat "$GUARD_DIR/elf-header.txt" 2>/dev/null; exit 1; }
 rm -rf "$GUARD_DIR"
+# Diagnostics in case a module is reported missing below.
+echo "--- nm init symbols (first 25) ---"
+"$CROSS_NM" "$CROSS_LIB" 2>&1 | grep " T init" | head -25 || true
+echo "--- modules actually compiled ---"
+ls -la "$WORK/py-arm"/Modules/*.o 2>/dev/null | head -30 || true
+echo "--- end diagnostics ---"
 for sym in initmath initerrno initposix inittime inititertools initoperator init_codecs init_sre; do
     "$CROSS_NM" "$CROSS_LIB" 2>/dev/null | grep -q "T $sym" || {
         echo "error: builtin module missing from libpython2.7.a: $sym" >&2
