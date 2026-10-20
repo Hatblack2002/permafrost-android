@@ -1,0 +1,87 @@
+diff --git a/src/map/raycast.c b/src/map/raycast.c
+index 0000000..0000000 100644
+--- a/src/map/raycast.c
++++ b/src/map/raycast.c
+@@ -65,6 +65,10 @@
+ 
+ static struct rc_ctx s_ctx;
++/* Android touch positions are normalized by SDL; store them in drawable pixels
++ * so terrain raycasting uses the same coordinate space as desktop mouse input. */
++static int s_touch_x;
++static int s_touch_y;
++static bool s_touch_active;
+ 
+ /*****************************************************************************/
+ /* STATIC FUNCTIONS                                                          */
+@@ -99,8 +103,13 @@ struct aabb aabb_for_tile(struct tile_desc desc, const struct map *map)
+ 
+ static vec3_t rc_unproject_mouse_coords(float ndc_z)
+ {
+-    int mouse_x, mouse_y;
+-    SDL_GetMouseState(&mouse_x, &mouse_y);
++    int mouse_x = 0, mouse_y = 0;
++    if(s_touch_active) {
++        mouse_x = s_touch_x;
++        mouse_y = s_touch_y;
++    } else {
++        SDL_GetMouseState(&mouse_x, &mouse_y);
++    }
+ 
+     int width, height;
+     Engine_WinDrawableSize(&width, &height);
+@@ -182,6 +191,30 @@ static void on_mousemove(void *user, void *event)
+     s_initial_intersec_tile = s_ctx.intersec_tile;
+     s_initial_active = s_ctx.tile_active;
+ }
++
++static void on_touch_pointer(void *user, void *event)
++{
++    SDL_Event *sdl_event = (SDL_Event*)event;
++    int width, height;
++    Engine_WinDrawableSize(&width, &height);
++    if(width <= 0 || height <= 0)
++        return;
++
++    switch(sdl_event->type) {
++    case SDL_FINGERDOWN:
++    case SDL_FINGERMOTION:
++        s_touch_x = (int)(sdl_event->tfinger.x * width);
++        s_touch_y = (int)(sdl_event->tfinger.y * height);
++        s_touch_active = true;
++        s_ctx.valid = false;
++        rc_compute();
++        break;
++    case SDL_FINGERUP:
++        s_touch_active = false;
++        s_ctx.valid = false;
++        break;
++    default:
++        break;
++    }
++}
+ 
+ static void on_render(void *user, void *event)
+ {
+@@ -249,6 +282,9 @@ int M_Raycast_Install(struct map *map, struct camera *cam)
+ 
+     E_Global_Register(SDL_MOUSEMOTION, on_mousemove, NULL, G_RUNNING);
++    E_Global_Register(SDL_FINGERDOWN, on_touch_pointer, NULL, G_RUNNING);
++    E_Global_Register(SDL_FINGERMOTION, on_touch_pointer, NULL, G_RUNNING);
++    E_Global_Register(SDL_FINGERUP, on_touch_pointer, NULL, G_RUNNING);
+     E_Global_Register(EVENT_RENDER_3D_POST, on_render, NULL, G_RUNNING | G_PAUSED_FULL | G_PAUSED_UI_RUNNING);
+     E_Global_Register(EVENT_UPDATE_START, on_update_start, NULL, G_RUNNING);
+@@ -260,6 +296,9 @@ void M_Raycast_Uninstall(void)
+ {
+     E_Global_Unregister(SDL_MOUSEMOTION, on_mousemove);
++    E_Global_Unregister(SDL_FINGERDOWN, on_touch_pointer);
++    E_Global_Unregister(SDL_FINGERMOTION, on_touch_pointer);
++    E_Global_Unregister(SDL_FINGERUP, on_touch_pointer);
+     E_Global_Unregister(EVENT_RENDER_3D_POST, on_render);
+     E_Global_Unregister(EVENT_UPDATE_START, on_update_start);
+ 
+@@ -268,6 +307,7 @@ void M_Raycast_Uninstall(void)
+     s_ctx.cam = NULL;
+     s_ctx.tile_active = false;
+     s_ctx.valid = false;
++    s_touch_active = false;
+ }
