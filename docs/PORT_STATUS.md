@@ -24,6 +24,60 @@
 
 ## Progress log
 
+### 2026-10-20 — Full-game APK link milestone
+
+Completed (link-level evidence only; no device claims):
+
+- **ARM64 dependency builds in CI** (`scripts/build-deps-android.sh`,
+  workflow `android-deps-arm64.yml`): CPython 2.7.17 cross-compiled to
+  a static `libpython2.7.a` for arm64-v8a (`--without-threads`,
+  `--without-signal-module`, `-fPIC`), with the C extension modules the
+  game scripts import (math, itertools, operator, _collections,
+  _heapq, _bisect, cStringIO, errno, posix, time, _codecs, _sre, …)
+  baked in statically via `Modules/Setup.local` before configure.
+  mimalloc and OpenAL Soft (OpenSL ES backend) built via the CMake NDK
+  toolchain. Guards verify AArch64 arch + `init*` builtin symbols.
+- **Android glue** (`android/app/jni/src/pf_android_main.c`): extracts
+  the packaged game data from APK assets into internal storage
+  (filelist-driven, idempotent per build stamp), then boots the
+  upstream `main()` — compiled into the glue TU so the static
+  `engine_init()`/`engine_shutdown()` remain reachable — with
+  `argv = {prog, <writable basepath>, scripts/rts/main.py}`.
+- **Link milestone** (`android/app/jni/Android.mk`): the pfengine
+  static library now includes the Python scripting subsystem
+  (`src/script/py_*.c`) and links the prebuilt python27/mimalloc/openal
+  archives; the `main` shared library anchors libc++ (ndk-build only
+  links the STL for modules with C++ sources) and links SDL2 + GLESv3 +
+  EGL + OpenSLES.
+- **Desktop-GL link shims** (`android/port-src/pf_gl_android.c`):
+  no-ops for glPointSize/glProvokingVertex, glDrawBuffer→glDrawBuffers,
+  ES-core forwarders resolved from `libGLESv3.so` (glMapBuffer,
+  glQueryCounter, glGetQueryObjectiv, glMultiDrawArraysIndirect),
+  glGetQueryObjectui64v via 64vEXT probe with uiv widening fallback,
+  FBO-based glGetTexImage/glGetTextureSubImage with per-texture size
+  tracking, and memfd_create via raw syscall below API 28 (mimalloc).
+- **Shader packaging** (`scripts/android-shader-es.py`): the APK's
+  shader tree is transformed from desktop GLSL to GLES 3.2 at packaging
+  time (`#version 320 es`, fragment precisions, `gl_ClipDistance[0]` →
+  `pf_clip0` varying + paired-fragment discard).
+- **Packaging**: game assets (`.blend` sources pruned), scripts +
+  Python mini-stdlib (`codecs`, `encodings`) and the transformed
+  shaders ship inside the APK (107.9 MB debug APK, 543 files,
+  libmain.so 7.0 MB). Workflow `android-game-apk.yml` produces the
+  `pf-android-game-debug-apk` artifact.
+
+Remaining blockers, in order:
+
+1. On-device acceptance of the game APK (Galaxy S20 FE): first-boot
+   extraction, engine boot through the loading screen, demo map load,
+   shader/SSBO/S3TC runtime checks. `adb logcat -s SDL pf-gl` captures
+   the boot trail (SDL redirects stdio to logcat).
+2. Touch input layer: pointer-coordinate abstraction for raycasting,
+   selection, camera and minimap (SDL synthesizes single-touch mouse
+   events; pinch/pan gestures still need real mapping).
+3. Cleanup iterations driven by on-device logs (S3TC terrain-bake path,
+   audio backend latency, etc.).
+
 ### 2026-10-20 — GLES portability, AArch64 scheduler, Android shell
 
 Completed (compile-level evidence only; no device claims):
