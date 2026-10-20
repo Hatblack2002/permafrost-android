@@ -6,7 +6,6 @@ import android.content.ClipboardManager;
 import android.graphics.Color;
 import android.graphics.Typeface;
 import android.os.Bundle;
-import android.os.CountDownLatch;
 import android.util.Log;
 import android.view.Gravity;
 import android.view.ViewGroup;
@@ -15,6 +14,8 @@ import android.widget.LinearLayout;
 import android.widget.ScrollView;
 import android.widget.TextView;
 import android.widget.Toast;
+
+import java.util.concurrent.CountDownLatch;
 
 import org.libsdl.app.SDLActivity;
 
