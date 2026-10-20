@@ -32,6 +32,11 @@ jobs:
         uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.9'
+          # The vendored SDL2 android-project ships its own (old) gradle
+          # wrapper jar whose hash is not in the known-checksums database.
+          # We never execute that wrapper; building with the pinned Gradle
+          # above, so skip repo-wide wrapper validation.
+          validate-wrappers: false
 
       - name: Build shell debug APK (SDL2 + GLES 3.2 smoke)
         working-directory: android
