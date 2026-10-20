@@ -16,10 +16,10 @@ jobs:
         run: git --version
       - name: Fetch pinned upstream
         run: bash scripts/prepare-upstream.sh
-      - name: Verify source assumptions and apply Android patches
+      - name: Verify source assumptions and apply touch adaptation
         run: |
           bash scripts/check-upstream.sh
-          bash scripts/apply-port-patches.sh
+          python3 scripts/patch-raycast-touch.py worktree/permafrost-engine
       - name: Confirm touch patch changed raycast source
         run: |
           grep -q 'SDL_FINGERDOWN' worktree/permafrost-engine/src/map/raycast.c
