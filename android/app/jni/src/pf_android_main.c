@@ -528,7 +528,7 @@ int main(int argc, char *argv[])
     (void)argc;
     (void)argv;
 
-    SDL_SetLogOutputFunction(pf_sdl_log_capture, NULL);
+    SDL_LogSetOutputFunction(pf_sdl_log_capture, NULL);
     pf_install_fatal_handlers();
     atexit(pf_atexit_report);
 
