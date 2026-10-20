@@ -297,6 +297,22 @@ static void rts_cam_on_mouseup(void *unused, void *event_arg)
         ctx->pan_disabled = false;
 }
 
+/* Android pinch zoom: SDL reports normalized distance deltas for a two-finger gesture. */
+static void rts_cam_on_multigesture(void *unused, void *event_arg)
+{
+    struct cam_rts_ctx *ctx = &s_cam_ctx.active_ctx.rts;
+    SDL_MultiGestureEvent *e = (SDL_MultiGestureEvent*)event_arg;
+
+    if(!s_rts_zoom_enabled || S_UI_TextEditHasFocus())
+        return;
+
+    /* Ignore tiny tracking noise; each accepted step is one existing zoom notch. */
+    if(e->dDist > 0.012f)
+        ctx->zoom_delta += 1;
+    else if(e->dDist < -0.012f)
+        ctx->zoom_delta -= 1;
+}
+
 static void rts_cam_on_mousewheel(void *unused, void *event_arg)
 {
     struct cam_rts_ctx *ctx = &s_cam_ctx.active_ctx.rts;
@@ -533,6 +549,7 @@ void CamControl_RTS_Install(struct camera *cam)
     E_Global_Register(SDL_MOUSEBUTTONDOWN, rts_cam_on_mousedown,  NULL, G_RUNNING);
     E_Global_Register(SDL_MOUSEBUTTONUP,   rts_cam_on_mouseup,    NULL, G_RUNNING);
     E_Global_Register(SDL_MOUSEWHEEL,      rts_cam_on_mousewheel, NULL, G_RUNNING);
+    E_Global_Register(SDL_MULTIGESTURE,    rts_cam_on_multigesture, NULL, G_RUNNING);
     E_Global_Register(EVENT_UPDATE_END,    rts_cam_on_update_end, NULL, 
         G_RUNNING | G_PAUSED_FULL | G_PAUSED_UI_RUNNING);
 
@@ -579,6 +596,7 @@ void CamControl_UninstallActive(void)
     if(s_cam_ctx.installed_on_mousedown)  E_Global_Unregister(SDL_MOUSEBUTTONDOWN, s_cam_ctx.installed_on_mousedown);
     if(s_cam_ctx.installed_on_mouseup)    E_Global_Unregister(SDL_MOUSEBUTTONUP,   s_cam_ctx.installed_on_mouseup);
     if(s_cam_ctx.installed_on_mousewheel) E_Global_Unregister(SDL_MOUSEWHEEL,       s_cam_ctx.installed_on_mousewheel);
+    E_Global_Unregister(SDL_MULTIGESTURE, rts_cam_on_multigesture);
     if(s_cam_ctx.installed_on_update_end) E_Global_Unregister(EVENT_UPDATE_END,    s_cam_ctx.installed_on_update_end);
 
     memset(&s_cam_ctx, 0, sizeof(s_cam_ctx));
