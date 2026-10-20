@@ -89,24 +89,19 @@ cp -r "$REPO_ROOT/engine/deps/Python" "$WORK/py-arm"
     grep -q '#include <malloc.h>' Objects/obmalloc.c || {
         echo "error: obmalloc.c malloc_usable_size patch did not apply" >&2; exit 1;
     }
-    ./configure \
-        --host="$HOST_TRIPLE" --build="$BUILD_TRIPLE" \
-        --prefix="$WORK/py-arm-install" \
-        --without-threads --without-signal-module --disable-ipv6 \
-        ac_cv_file__dev_ptmx=yes ac_cv_file__dev_ptc=no \
-        ac_cv_header_langinfo_h=no \
-        PYTHON_FOR_BUILD="$WORK/hostbin/python -E" \
-        > cross-configure.log 2>&1 || { tail -n 120 cross-configure.log; exit 1; }
 
     # CPython 2.7 builds its C extension modules through setup.py as .so
     # files by default — impossible here (no on-device interpreter, no
     # dynamic loading in the embedded lib). Enforce a static set instead:
-    # makesetup folds these into libpython2.7.a and registers them in
-    # _PyImport_Inittab. The set covers every import-time C dependency of
-    # the engine's game scripts (math, itertools, operator, _collections,
-    # _heapq, _bisect, cStringIO, errno, time) plus common extras; the
-    # rest of the game runtime comes from the engine's pure-Python
-    # scripts/stdlib.
+    # write Modules/Setup.local BEFORE configure so the makesetup pass
+    # bakes MODOBJS into the generated Makefile (writing it after
+    # configure leaves the Makefile without the modules — the mid-make
+    # config.c regeneration does not update the MODOBJS variable).
+    # The set covers every import-time C dependency of the engine's game
+    # scripts (math, itertools, operator, _collections, _heapq, _bisect,
+    # cStringIO, errno, time); _codecs/_sre are mandatory because
+    # Py_InitializeEx eagerly imports encodings.utf_8. The rest of the
+    # game runtime comes from the engine's pure-Python scripts/stdlib.
     cat > Modules/Setup.local <<'SETUP'
 # Static modules for the embedded Android interpreter (scripts/build-deps-android.sh)
 # _codecs and _sre are mandatory: Py_InitializeEx eagerly imports
@@ -132,6 +127,21 @@ cPickle cPickle.c
 _random _randommodule.c
 _functools _functoolsmodule.c
 SETUP
+
+    ./configure \
+        --host="$HOST_TRIPLE" --build="$BUILD_TRIPLE" \
+        --prefix="$WORK/py-arm-install" \
+        --without-threads --without-signal-module --disable-ipv6 \
+        ac_cv_file__dev_ptmx=yes ac_cv_file__dev_ptc=no \
+        ac_cv_header_langinfo_h=no \
+        PYTHON_FOR_BUILD="$WORK/hostbin/python -E" \
+        > cross-configure.log 2>&1 || { tail -n 120 cross-configure.log; exit 1; }
+
+    # Sanity: the final Makefile must carry the static module set.
+    grep -q "Modules/mathmodule.o" Makefile || {
+        echo "error: MODOBJS lacks mathmodule.o — Setup.local not processed" >&2
+        exit 1;
+    }
 
     make -j"$JOBS" libpython2.7.a PGEN="$WORK/hostbin/pgen" \
         > cross-make.log 2>&1 || { tail -n 120 cross-make.log; exit 1; }
