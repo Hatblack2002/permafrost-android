@@ -1,0 +1,51 @@
+name: Import original Permafrost engine source
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "upstream.lock"
+      - ".github/workflows/import-upstream-engine.yml"
+
+permissions:
+  contents: write
+
+jobs:
+  import-source:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Android port repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+      - name: Read pinned upstream revision
+        id: pin
+        shell: bash
+        run: |
+          source upstream.lock
+          echo "url=$UPSTREAM_URL" >> "$GITHUB_OUTPUT"
+          echo "ref=$UPSTREAM_REF" >> "$GITHUB_OUTPUT"
+      - name: Clone original engine at pinned revision
+        run: |
+          git clone --filter=blob:none --no-checkout "${{ steps.pin.outputs.url }}" /tmp/permafrost-upstream
+          git -C /tmp/permafrost-upstream fetch --depth 1 origin "${{ steps.pin.outputs.ref }}"
+          git -C /tmp/permafrost-upstream checkout --detach "${{ steps.pin.outputs.ref }}"
+          test "$(git -C /tmp/permafrost-upstream rev-parse HEAD)" = "${{ steps.pin.outputs.ref }}"
+      - name: Copy original source without replacing port documentation
+        shell: bash
+        run: |
+          mkdir -p engine
+          tar -C /tmp/permafrost-upstream --exclude=.git -cf - . | tar -C engine -xf -
+          printf 'Upstream URL: %s\nPinned revision: %s\n' "${{ steps.pin.outputs.url }}" "${{ steps.pin.outputs.ref }}" > engine/UPSTREAM_SOURCE.txt
+      - name: Commit original engine into this repository
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add engine/
+          if git diff --cached --quiet; then
+            echo "Engine source already matches the pinned upstream revision."
+            exit 0
+          fi
+          git commit -m "vendor: import original Permafrost engine source [skip ci]"
+          git push origin HEAD:main
