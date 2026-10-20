@@ -141,8 +141,17 @@ CROSS_LIB="$WORK/py-arm/libpython2.7.a"
 # Guard: the statically-enabled module set must have made it into the
 # archive's builtin-module table (initmath/initerrno/...), and the
 # library must really be AArch64 (not a stale/host-arch artifact).
-"$CROSS_READELF" -h "$CROSS_LIB" | grep -q "AArch64" || {
-    echo "error: libpython2.7.a is not AArch64" >&2; exit 1; }
+# readelf -h cannot parse the archive's symbol-index member directly,
+# so inspect a real object member instead.
+GUARD_DIR="$(mktemp -d)"
+( cd "$GUARD_DIR" \
+  && "$CROSS_AR" x "$CROSS_LIB" \
+  && FIRST_OBJ="$(ls *.o | sort | head -n1)" \
+  && "$CROSS_READELF" -h "$FIRST_OBJ" | tee "$GUARD_DIR/elf-header.txt" \
+                                  | grep -q "AArch64" ) \
+  || { echo "error: libpython2.7.a is not AArch64" >&2
+       cat "$GUARD_DIR/elf-header.txt" 2>/dev/null; exit 1; }
+rm -rf "$GUARD_DIR"
 for sym in initmath initerrno initposix inittime inititertools initoperator init_codecs init_sre; do
     "$CROSS_NM" "$CROSS_LIB" 2>/dev/null | grep -q "T $sym" || {
         echo "error: builtin module missing from libpython2.7.a: $sym" >&2
