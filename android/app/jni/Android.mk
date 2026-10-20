@@ -133,6 +133,12 @@ LOCAL_SRC_FILES := src/pf_android_main.c
 
 LOCAL_STATIC_LIBRARIES := pfengine python27 mimalloc openal
 
+# pf_android_main.c is C, but pfengine's static deps (mimalloc, OpenAL
+# Soft) are C++ and need the libc++ runtime at the final link. ndk-build
+# only links the STL into modules with C++ sources unless this is set
+# (NDK docs: PREBUILT static libraries section).
+LOCAL_CPP_FEATURES := rtti exceptions
+
 LOCAL_SHARED_LIBRARIES := SDL2
 
 LOCAL_LDLIBS := -lGLESv3 -lEGL -lOpenSLES -llog -landroid -lm -ldl -lz
