@@ -120,7 +120,10 @@ include $(CLEAR_VARS)
 
 LOCAL_MODULE := main
 
-LOCAL_CFLAGS := -std=c99 -O2 -Wno-format
+# -std=c99 must be C-only (LOCAL_CONLYFLAGS): the module also compiles
+# pf_stdcpp_anchor.cpp, and clang rejects -std=c99 for C++ inputs.
+LOCAL_CONLYFLAGS := -std=c99
+LOCAL_CFLAGS := -O2 -Wno-format
 
 LOCAL_C_INCLUDES := \
     $(SDL_PATH)/include \
