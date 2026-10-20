@@ -10,8 +10,8 @@ android {
         applicationId "io.github.hatblack2002.permafrost"
         minSdk 24          /* OpenGL ES 3.1 devices; 3.2 features validated on target */
         targetSdk 34
-        versionCode 1
-        versionName "0.1.0-android-shell"
+        versionCode 2
+        versionName "0.2.0-android-game"
 
         ndk {
             abiFilters 'arm64-v8a'

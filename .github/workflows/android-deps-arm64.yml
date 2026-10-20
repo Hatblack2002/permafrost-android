@@ -1,0 +1,54 @@
+name: Android deps ARM64
+
+# Cross-builds the boot-blocking engine dependencies for arm64-v8a and
+# uploads them as the pf-android-deps-arm64 artifact, which the
+# android-game-apk workflow consumes to link the full engine:
+#   - CPython 2.7.17 static library (embedded interpreter, src/script/py_*.c)
+#   - mimalloc static library (engine allocator backend)
+#   - OpenAL Soft static library (OpenSL ES backend for Audio_Init)
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "scripts/build-deps-android.sh"
+      - ".github/workflows/android-deps-arm64.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  deps:
+    name: Cross-build Python 2.7 / mimalloc / OpenAL (arm64-v8a)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Show toolchain
+        run: |
+          echo "NDK: ${ANDROID_NDK_LATEST_HOME:-unset}"
+          ls "${ANDROID_NDK_LATEST_HOME:-/nonexistent}/toolchains/llvm/prebuilt/" || true
+          cmake --version | head -n1
+
+      - name: Cross-build dependencies
+        run: bash scripts/build-deps-android.sh "$RUNNER_TEMP/pf-deps-stage"
+
+      - name: Verify staged layout
+        run: |
+          test -f "$RUNNER_TEMP/pf-deps-stage/prebuilt/python/libpython2.7.a"
+          test -f "$RUNNER_TEMP/pf-deps-stage/prebuilt/python/pyconfig.h"
+          test -f "$RUNNER_TEMP/pf-deps-stage/prebuilt/mimalloc/libmimalloc.a"
+          test -f "$RUNNER_TEMP/pf-deps-stage/prebuilt/openal/libopenal.a"
+          echo "### pf-android-deps-arm64" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          find "$RUNNER_TEMP/pf-deps-stage/prebuilt" -type f \
+            -exec ls -la {} \; >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload deps artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: pf-android-deps-arm64
+          path: ${{ runner.temp }}/pf-deps-stage
+          if-no-files-found: error
+          retention-days: 30

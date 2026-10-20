@@ -1,0 +1,171 @@
+name: Android game APK
+
+# Builds the full Permafrost Engine game APK for arm64-v8a:
+#   job deps : cross-builds CPython 2.7 / mimalloc / OpenAL Soft and
+#              uploads the pf-android-deps-arm64 artifact.
+#   job game : downloads the deps, packages the engine's assets/scripts/
+#              shaders (GLES-transformed) into the APK, links the full
+#              engine (including the Python scripting subsystem) and
+#              uploads the pf-android-game-debug-apk artifact.
+#
+# Evidence rule: building this APK is link-level evidence only. Claims
+# about the game actually RUNNING on a device require on-device logs
+# (see docs/PORT_STATUS.md).
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "android/**"
+      - "engine/deps/SDL2/android-project/**"
+      - "scripts/build-deps-android.sh"
+      - "scripts/android-shader-es.py"
+      - ".github/workflows/android-game-apk.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  deps:
+    name: Cross-build Python 2.7 / mimalloc / OpenAL (arm64-v8a)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cross-build dependencies
+        run: bash scripts/build-deps-android.sh "$RUNNER_TEMP/pf-deps-stage"
+
+      - name: Verify staged layout
+        run: |
+          test -f "$RUNNER_TEMP/pf-deps-stage/prebuilt/python/libpython2.7.a"
+          test -f "$RUNNER_TEMP/pf-deps-stage/prebuilt/python/pyconfig.h"
+          test -f "$RUNNER_TEMP/pf-deps-stage/prebuilt/mimalloc/libmimalloc.a"
+          test -f "$RUNNER_TEMP/pf-deps-stage/prebuilt/openal/libopenal.a"
+
+      - name: Upload deps artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: pf-android-deps-arm64
+          path: ${{ runner.temp }}/pf-deps-stage
+          if-no-files-found: error
+          retention-days: 30
+
+  game:
+    name: Package assets and link the full engine into the game APK
+    needs: deps
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      # Pin Gradle: the ubuntu-latest image migrated to Ubuntu 26.04
+      # (2026-10-19) and now ships Gradle 9.8.1 + a JDK 25 default, neither
+      # of which is compatible with the pinned AGP 8.5.2.
+      - name: Pin Gradle 8.9 (AGP 8.5.2 compatible)
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+          # The vendored SDL2 android-project ships its own (old) gradle
+          # wrapper jar whose hash is not in the known-checksums database.
+          # We never execute that wrapper; building with the pinned Gradle
+          # above, so skip repo-wide wrapper validation.
+          validate-wrappers: false
+
+      - name: Download prebuilt deps
+        uses: actions/download-artifact@v4
+        with:
+          name: pf-android-deps-arm64
+          path: android/app/jni
+
+      - name: Verify prebuilt layout
+        run: |
+          test -f android/app/jni/prebuilt/python/libpython2.7.a
+          test -f android/app/jni/prebuilt/python/pyconfig.h
+          test -f android/app/jni/prebuilt/mimalloc/libmimalloc.a
+          test -f android/app/jni/prebuilt/openal/libopenal.a
+          cat android/app/jni/prebuilt/BUILD_INFO.txt
+
+      # Shaders are transformed from desktop GLSL (330/430 core) to GLES
+      # 3.2 at packaging time; the engine sources stay pristine.
+      - name: Transform shaders to GLES 3.2
+        run: |
+          mkdir -p android/app/src/main/assets/pf/shaders
+          python3 scripts/android-shader-es.py \
+            engine/shaders android/app/src/main/assets/pf/shaders
+
+      # The embedded interpreter resolves PYTHONHOME=<basepath>/scripts
+      # and therefore looks for its codec packages under
+      # scripts/lib/python2.7. Ship the minimal set the engine's scripts
+      # need (codecs + encodings); everything else comes from the
+      # engine's own scripts/stdlib.
+      - name: Package Python scripts and mini-stdlib
+        run: |
+          set -e
+          A=android/app/src/main/assets/pf
+          mkdir -p "$A"
+          cp -r engine/scripts "$A/scripts"
+          mkdir -p "$A/scripts/lib/python2.7/encodings"
+          cp engine/deps/Python/Lib/codecs.py "$A/scripts/lib/python2.7/"
+          cp engine/deps/Python/Lib/encodings/__init__.py \
+             engine/deps/Python/Lib/encodings/aliases.py \
+             engine/deps/Python/Lib/encodings/ascii.py \
+             engine/deps/Python/Lib/encodings/latin_1.py \
+             engine/deps/Python/Lib/encodings/utf_8.py \
+             engine/deps/Python/Lib/encodings/utf_8_sig.py \
+             "$A/scripts/lib/python2.7/encodings/"
+
+      # Game data: everything under engine/assets except the Blender
+      # source files (63 MB of dev-only content inside models/).
+      - name: Package game assets
+        run: |
+          set -e
+          A=android/app/src/main/assets/pf
+          mkdir -p "$A"
+          rsync -a --exclude='*.blend' --exclude='*.blend1' \
+            engine/assets/ "$A/assets/"
+          du -sh "$A"
+
+      # The boot glue walks this manifest instead of using JNI directory
+      # enumeration: one SDL_RWFromFile-friendly text file.
+      - name: Generate asset manifest and build stamp
+        run: |
+          set -e
+          A=android/app/src/main/assets
+          ( cd "$A" && find pf -type f | LC_ALL=C sort ) > "$A/pf.filelist"
+          echo "${GITHUB_RUN_ID}-${GITHUB_SHA}" > "$A/pf.buildstamp"
+          echo "filelist entries: $(wc -l < "$A/pf.filelist")"
+
+      - name: Build game debug APK (full engine link)
+        working-directory: android
+        run: gradle assembleDebug --no-daemon --stacktrace
+
+      - name: Verify the APK was produced
+        run: |
+          test -f android/app/build/outputs/apk/debug/app-debug.apk
+          ls -la android/app/build/outputs/apk/debug/
+          du -sh android/app/build/outputs/apk/debug/app-debug.apk
+
+      - name: Upload game debug APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: pf-android-game-debug-apk
+          path: android/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+
+      - name: Report milestone scope
+        run: |
+          echo "### Permafrost game APK (link milestone)" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "Full engine (97 C sources incl. the Python 2.7 scripting" >> "$GITHUB_STEP_SUMMARY"
+          echo "subsystem) linked into libmain.so with CPython 2.7," >> "$GITHUB_STEP_SUMMARY"
+          echo "mimalloc and OpenAL Soft (OpenSL ES). Assets, scripts and" >> "$GITHUB_STEP_SUMMARY"
+          echo "GLES 3.2 shaders packaged into the APK; extracted to" >> "$GITHUB_STEP_SUMMARY"
+          echo "internal storage on first boot." >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "Link-level evidence only: on-device boot validation is a" >> "$GITHUB_STEP_SUMMARY"
+          echo "separate acceptance gate (docs/PORT_STATUS.md)." >> "$GITHUB_STEP_SUMMARY"
