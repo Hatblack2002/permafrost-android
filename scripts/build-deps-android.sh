@@ -79,6 +79,10 @@ cp -r "$REPO_ROOT/engine/deps/Python" "$WORK/py-arm"
 (
     cd "$WORK/py-arm"
     export CC="$CROSS_CC" AR="$CROSS_AR" RANLIB="$CROSS_RANLIB" READELF="$CROSS_READELF"
+    # -fPIC is mandatory: the archive is linked into the app's shared
+    # libmain.so; without it ld.lld rejects every reference to Py* symbols
+    # ("relocation R_AARCH64_* cannot be used against symbol 'PySeqIter_Type'").
+    export CFLAGS="-fPIC -O2 -DNDEBUG -fno-strict-aliasing -fwrapv"
 
     # bionic declares `size_t malloc_usable_size(const void*)` in
     # <malloc.h>; the Permafrost Engine accounting patch in obmalloc.c
@@ -202,7 +206,7 @@ grep -q 'return mStore.mValue' "$OAL_ALOPT" || {
 cmake -S "$REPO_ROOT/engine/deps/mimalloc" -B "$WORK/mi" \
     -DCMAKE_TOOLCHAIN_FILE="$TCFILE" \
     -DANDROID_ABI="$ABI" -DANDROID_PLATFORM="android-$API" \
-    -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_BUILD_TYPE=Release -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
     -DMI_BUILD_SHARED=OFF -DMI_BUILD_OBJECT=OFF -DMI_BUILD_TESTS=OFF \
     > "$WORK/mi-cmake.log" 2>&1 || { tail -n 80 "$WORK/mi-cmake.log"; exit 1; }
 cmake --build "$WORK/mi" -j"$JOBS" > "$WORK/mi-build.log" 2>&1 \
@@ -214,7 +218,7 @@ cp "$MI_LIB" "$STAGE/prebuilt/mimalloc/libmimalloc.a"
 cmake -S "$WORK/oal-src" -B "$WORK/oal" \
     -DCMAKE_TOOLCHAIN_FILE="$TCFILE" \
     -DANDROID_ABI="$ABI" -DANDROID_PLATFORM="android-$API" \
-    -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_BUILD_TYPE=Release -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
     -DLIBTYPE=STATIC \
     -DALSOFT_UTILS=OFF -DALSOFT_EXAMPLES=OFF -DALSOFT_TESTS=OFF \
     -DALSOFT_BACKEND_OPENSL=ON \
