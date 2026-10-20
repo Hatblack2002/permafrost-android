@@ -129,7 +129,8 @@ LOCAL_C_INCLUDES := \
     $(PREBUILT)/python \
     $(LOCAL_PATH)/../../../android/include
 
-LOCAL_SRC_FILES := src/pf_android_main.c
+LOCAL_SRC_FILES := src/pf_android_main.c \
+    src/pf_stdcpp_anchor.cpp
 
 LOCAL_STATIC_LIBRARIES := pfengine python27 mimalloc openal
 
