@@ -61,8 +61,14 @@ LOCAL_C_INCLUDES := \
     $(PF_ROOT)/deps/openal-soft/include \
     $(PF_ROOT)/deps/mimalloc/include \
     $(PF_ROOT)/deps/GLEW/include \
-    $(PF_ROOT)/deps/Python/Include
+    $(PF_ROOT)/deps/Python/Include \
+    $(LOCAL_PATH)/../../../android/include
 
 LOCAL_SRC_FILES := $(PF_SRCS:$(LOCAL_PATH)/%=%) $(PF_ASM:$(LOCAL_PATH)/%=%)
+
+# Android port adapter layer: GLES portability header plus the runtime
+# glBufferStorage / extension-flag resolution it declares. Compiled here
+# so the compile report carries evidence for the port sources too.
+LOCAL_SRC_FILES += ../../../android/port-src/pf_gl_android.c
 
 include $(BUILD_STATIC_LIBRARY)

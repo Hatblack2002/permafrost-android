@@ -8,6 +8,7 @@ on:
       - "android/tests/**"
       - "scripts/patch-glew-gles.py"
       - "scripts/patch-sched-arm64.py"
+      - "scripts/patch-simd-arm64.py"
       - "engine/src/**"
       - ".github/workflows/android-engine-compile-report.yml"
 
@@ -21,10 +22,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Apply GLES portability and AArch64 scheduler patches in-place
+      - name: Apply GLES, AArch64 scheduler and SIMD patches in-place
         run: |
           python3 scripts/patch-glew-gles.py engine
           python3 scripts/patch-sched-arm64.py engine
+          python3 scripts/patch-simd-arm64.py engine
 
       - name: Build AArch64 layout guard
         working-directory: android/tests

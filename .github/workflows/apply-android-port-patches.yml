@@ -6,6 +6,7 @@ on:
     paths:
       - "scripts/patch-glew-gles.py"
       - "scripts/patch-sched-arm64.py"
+      - "scripts/patch-simd-arm64.py"
       - "android/include/pf_gl.h"
       - "android/port-src/pf_gl_android.c"
       - "android/tests/sched_ctx_offsets.c"
@@ -31,15 +32,17 @@ jobs:
           test -f engine/src/context_switch.S
           grep -q "$UPSTREAM_REF" engine/UPSTREAM_SOURCE.txt
 
-      - name: Apply GLES portability and AArch64 scheduler patches
+      - name: Apply GLES, AArch64 scheduler and SIMD patches
         run: |
           python3 scripts/patch-glew-gles.py engine
           python3 scripts/patch-sched-arm64.py engine
+          python3 scripts/patch-simd-arm64.py engine
 
       - name: Verify patches are idempotent
         run: |
           python3 scripts/patch-glew-gles.py engine
           python3 scripts/patch-sched-arm64.py engine
+          python3 scripts/patch-simd-arm64.py engine
           python3 - <<'PY'
           from pathlib import Path
           header = Path("android/include/pf_gl.h").read_text()
@@ -72,7 +75,27 @@ jobs:
           ]:
               if marker not in sched:
                   raise SystemExit(f"sched.c: missing {marker}")
-          print("GLES portability layer and AArch64 scheduler port verified.")
+          simd_h = Path("engine/src/lib/public/simd.h").read_text()
+          for marker in [
+              "(defined(__x86_64__) || defined(__i386__))\n#  define SIMD_TARGET_AVX2",
+          ]:
+              if marker not in simd_h:
+                  raise SystemExit(f"simd.h: missing x86 gate ({marker.splitlines()[0]})")
+          bg = Path("engine/src/lib/public/bitmap_grid.h").read_text()
+          for marker in [
+              "#if SIMD_HAS_TARGET_AVX2",
+              "#define _BG_AVX2_FUNCS(name, type)",
+              "_BG_AVX2_DISPATCH(name)",
+              "#if SIMD_HAS_TARGET_AVX512F",
+              "#define _BG_AVX512_FUNCS(name, type)",
+              "_BG_AVX512_DISPATCH(name)",
+          ]:
+              if marker not in bg:
+                  raise SystemExit(f"bitmap_grid.h: missing {marker}")
+          if bg.count("#define _BG_AVX2_FUNCS(name, type)") != 2:
+              raise SystemExit("bitmap_grid.h: _BG_AVX2_FUNCS define duplicated")
+          print("GLES portability layer, AArch64 scheduler port and SIMD "
+                "sub-macro structure verified.")
           PY
 
       - name: Commit adapted engine sources
@@ -85,5 +108,5 @@ jobs:
             echo "Android port patches already applied."
             exit 0
           fi
-          git commit -m "android: GLES portability layer and AArch64 scheduler port [skip ci]"
+          git commit -m "android: GLES layer, AArch64 scheduler and SIMD port [skip ci]"
           git push origin HEAD:main
