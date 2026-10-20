@@ -175,10 +175,7 @@ void glTexImage2D(GLenum target, GLint level, GLint internalformat,
         pf_tex_record((GLuint)bound, width, height, 1);
     }
 }
-                  GLsizei width, GLsizei height, GLsizei depth,
-                  GLint border, GLenum format, GLenum type,
-                  const void *pixels);
-void glTexImage3D(GLenum target, GLint level, GLint internalformat,
+
 typedef void (*pf_gl_teximg3d_t)(GLenum, GLint, GLint, GLsizei, GLsizei,
                                  GLsizei, GLint, GLenum, GLenum,
                                  const void *);
