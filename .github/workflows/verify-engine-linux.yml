@@ -26,7 +26,11 @@ jobs:
             libwayland-dev wayland-protocols libxkbcommon-dev libgl1-mesa-dev
       - name: Prepare upstream dependencies
         working-directory: engine
-        run: make deps
+        run: |
+          # GLEW's auto-generation target copies generated files into src/,
+          # but the upstream source archive does not track that empty directory.
+          mkdir -p deps/GLEW/src
+          make deps
       - name: Compile the original engine with Android touch changes
         working-directory: engine
         run: make pf
