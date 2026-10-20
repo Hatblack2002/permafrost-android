@@ -10,10 +10,5 @@ actual="$(git -C "$SRC" rev-parse HEAD)"
 # shellcheck disable=SC1091
 source "$ROOT/upstream.lock"
 [[ "$actual" == "$UPSTREAM_REF" ]] || { echo "Refusing to patch unexpected upstream revision: $actual" >&2; exit 3; }
-for patch in "$ROOT"/patches/*.patch; do
-  [[ -f "$patch" ]] || continue
-  echo "Checking $patch"
-  git -C "$SRC" apply --check "$patch"
-  git -C "$SRC" apply "$patch"
-done
-echo "Port patches applied. This is not yet a successful Android build."
+python3 "$ROOT/scripts/patch-raycast-touch.py" "$SRC"
+echo "Touch adaptation applied. This is not yet a successful Android build."
