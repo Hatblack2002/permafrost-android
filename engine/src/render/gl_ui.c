@@ -53,7 +53,7 @@
 
 #include <assert.h>
 
-#include <GL/glew.h>
+#include "pf_gl.h"
 
 #undef PF_MALLOC
 #undef PF_CALLOC

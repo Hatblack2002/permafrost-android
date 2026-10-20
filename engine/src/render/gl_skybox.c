@@ -50,7 +50,7 @@
 #include "../lib/public/pf_string.h"
 #include "../lib/public/stb_image.h"
 
-#include <GL/glew.h>
+#include "pf_gl.h"
 #include <assert.h>
 #include <string.h>
 

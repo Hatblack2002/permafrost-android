@@ -38,7 +38,7 @@
 
 #include "../pf_math.h"
 #include <stdint.h>
-#include <GL/glew.h>
+#include "pf_gl.h"
 
 
 #define PACK_32(name, ...)      \

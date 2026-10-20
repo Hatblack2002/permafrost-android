@@ -36,7 +36,7 @@
 #ifndef GL_TEXTURE_H
 #define GL_TEXTURE_H
 
-#include <GL/glew.h>
+#include "pf_gl.h"
 #include <stdbool.h>
 #include <stdint.h>
 

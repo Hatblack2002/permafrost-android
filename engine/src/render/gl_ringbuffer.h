@@ -38,7 +38,7 @@
 
 #include <stdbool.h>
 #include <stddef.h>
-#include <GL/glew.h>
+#include "pf_gl.h"
 
 /* The ringbuffer is used for efficient submission of streamed data
  * to the GPU. The key principle is using a manually synchronized buffer,

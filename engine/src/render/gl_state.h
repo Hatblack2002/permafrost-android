@@ -37,7 +37,7 @@
 
 #include "../pf_math.h"
 #include <stdbool.h>
-#include <GL/glew.h>
+#include "pf_gl.h"
 
 #define GL_U_PROJECTION         "projection"
 #define GL_U_VIEW               "view"

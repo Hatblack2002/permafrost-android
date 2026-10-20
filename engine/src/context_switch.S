@@ -161,6 +161,109 @@ sched_task_exit_trampoline:
 
 #endif
 
+#elif defined(__aarch64__)
+
+/*
+ * AArch64 (ARMv8-A) context switch for the Permafrost task scheduler.
+ * Added by the Android port (scripts/patch-sched-arm64.py).
+ *
+ * struct context layout is defined in sched.c (__aarch64__ branch); the
+ * byte offsets are documented there and MUST stay in sync with this file.
+ *
+ * AArch64 ABI notes:
+ *   - x19-x28, x29 (fp), x30 (lr) and d8-d15 are callee-saved, so they
+ *     form the fiber context, exactly like rbx/rbp/r12-r15 do on SysV.
+ *   - fpsr/fpcr replace mxcsr/fpucw.
+ *   - x0 is both the return-value register and the first argument
+ *     register, so the x86 trick of moving retval to %rax and arg to %rdi
+ *     does not translate. The retval stays in x0 (the resumed context
+ *     reads it as sched_switch_ctx's return value) and the fresh-task
+ *     argument is parked in x17 (caller-saved scratch) for the entry
+ *     trampoline to copy into x0.
+ */
+
+.text
+.global sched_switch_ctx
+.global sched_task_entry_trampoline
+.global sched_task_exit_trampoline
+
+/*
+ * uint64_t sched_switch_ctx(struct context *save, struct context *restore,
+ *                           uint64_t retval, void *arg)
+ *   x0 - save ctx ptr
+ *   x1 - load ctx ptr
+ *   x2 - return value
+ *   x3 - arg passed to context code
+ */
+sched_switch_ctx:
+    /* Push the resume address, like the x86_64 implementation pushes
+     * Lback: the next switch into this context 'ret's into it. sp stays
+     * 16-byte aligned. */
+    adr     x16, Larm64_back
+    str     x16, [sp, #-16]!
+
+    /* Save callee-saved registers */
+    stp     x19, x20, [x0, #0]
+    stp     x21, x22, [x0, #16]
+    stp     x23, x24, [x0, #32]
+    stp     x25, x26, [x0, #48]
+    stp     x27, x28, [x0, #64]
+    stp     x29, x30, [x0, #80]
+    mov     x16, sp
+    str     x16, [x0, #96]
+    mrs     x17, fpsr
+    str     w17, [x0, #104]
+    mrs     x17, fpcr
+    str     w17, [x0, #108]
+    stp     d8,  d9,  [x0, #112]
+    stp     d10, d11, [x0, #128]
+    stp     d12, d13, [x0, #144]
+    stp     d14, d15, [x0, #160]
+
+    /* Load callee-saved registers of the destination context */
+    ldp     x19, x20, [x1, #0]
+    ldp     x21, x22, [x1, #16]
+    ldp     x23, x24, [x1, #32]
+    ldp     x25, x26, [x1, #48]
+    ldp     x27, x28, [x1, #64]
+    ldp     x29, x30, [x1, #80]
+    ldr     x16, [x1, #96]
+    mov     sp, x16
+    ldr     w17, [x1, #104]
+    msr     fpsr, x17
+    ldr     w17, [x1, #108]
+    msr     fpcr, x17
+    ldp     d8,  d9,  [x1, #112]
+    ldp     d10, d11, [x1, #128]
+    ldp     d12, d13, [x1, #144]
+    ldp     d14, d15, [x1, #160]
+
+    mov     x17, x3            /* arg for the fresh-task entry shim */
+    mov     x0,  x2            /* retval: sched_switch_ctx's return value */
+
+Larm64_back:
+    ret
+
+/*
+ * First entry into a fresh task. sched_task_init stores the task entry
+ * address in ctx.x19 and the switch above leaves the task argument in x17.
+ * The task returns a struct result in x0/x1, which is exactly the calling
+ * convention of sched_task_exit(struct result).
+ */
+sched_task_entry_trampoline:
+    mov     x0, x17
+    blr     x19
+    b       sched_task_exit
+
+/*
+ * On x86_64 the task function's own 'ret' pops this trampoline off the
+ * task stack. It is kept as a symbol so the stack-walking debug helpers
+ * keep their anchor; on AArch64 the entry trampoline tail-calls
+ * sched_task_exit directly.
+ */
+sched_task_exit_trampoline:
+    b       sched_task_exit
+
 #else
 #error "Unsupported platform"
 #endif

@@ -36,7 +36,7 @@
 #ifndef GL_SHADER_H
 #define GL_SHADER_H
 
-#include <GL/glew.h>
+#include "pf_gl.h"
 
 #include <stdbool.h>
 

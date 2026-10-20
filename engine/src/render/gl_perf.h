@@ -37,7 +37,7 @@
 #define GL_PERF_H
 
 #include "../perf.h"
-#include <GL/glew.h>
+#include "pf_gl.h"
 
 #include "gl_assert.h"
 

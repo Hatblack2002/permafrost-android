@@ -57,7 +57,7 @@
 #include "../main.h"
 #include "../perf.h"
 
-#include <GL/glew.h>
+#include "pf_gl.h"
 
 #include <stdlib.h>
 #include <stddef.h>

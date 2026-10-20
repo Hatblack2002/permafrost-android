@@ -53,7 +53,7 @@
 #include "../map/public/tile.h"
 #include "../mem.h"
 
-#include <GL/glew.h>
+#include "pf_gl.h"
 
 #include <string.h>
 #include <assert.h>

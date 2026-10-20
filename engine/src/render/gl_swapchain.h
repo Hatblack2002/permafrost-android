@@ -36,7 +36,7 @@
 #ifndef GL_SWAPCHAIN_H
 #define GL_SWAPCHAIN_H
 
-#include <GL/glew.h>
+#include "pf_gl.h"
 #include <stdbool.h>
 
 bool R_GL_SwapchainInit(void);

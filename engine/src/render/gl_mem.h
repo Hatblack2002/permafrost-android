@@ -45,7 +45,7 @@
  */
 
 #include <stdint.h>
-#include <GL/glew.h>
+#include "pf_gl.h"
 
 enum gpu_mem_sys{
     GPU_MEM_SYS_UNKNOWN = 0,

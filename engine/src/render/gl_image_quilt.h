@@ -36,7 +36,7 @@
 #ifndef GL_IMAGE_QUILT_H
 #define GL_IMAGE_QUILT_H
 
-#include <GL/glew.h>
+#include "pf_gl.h"
 #include <stdbool.h>
 
 struct texture_arr;

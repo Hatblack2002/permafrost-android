@@ -36,7 +36,7 @@
 #ifndef PF_MATH_H
 #define PF_MATH_H
 
-#include <GL/glew.h> /* GLfloat definition */
+#include "pf_gl.h" /* GLfloat definition */
 #include <stdio.h>   /* FILE definition    */
 #ifndef _USE_MATH_DEFINES
     #define _USE_MATH_DEFINES

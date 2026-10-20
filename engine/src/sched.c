@@ -139,6 +139,40 @@ struct context{
 
 #endif
 
+#elif defined(__aarch64__)
+
+/* AArch64 fiber context, added by the Android port
+ * (scripts/patch-sched-arm64.py). Field names rsp/rbp/mxcsr/fpucw are
+ * kept from the x86_64 implementation so the generic scheduler code
+ * compiles unchanged; on AArch64 'rsp' is sp, 'rbp' is the frame pointer
+ * (x29), and mxcsr/fpucw are unused (AArch64 has no x87/SSE control
+ * words). The layout MUST match the offsets in context_switch.S. */
+struct context{
+    uint64_t x19;
+    uint64_t x20;
+    uint64_t x21;
+    uint64_t x22;
+    uint64_t x23;
+    uint64_t x24;
+    uint64_t x25;
+    uint64_t x26;
+    uint64_t x27;
+    uint64_t x28;
+    uint64_t rbp;      /* x29 frame pointer */
+    uint64_t lr;       /* x30 link register */
+    uint64_t rsp;      /* stack pointer */
+    uint32_t mxcsr;    /* unused on AArch64 */
+    uint32_t fpucw;    /* unused on AArch64 */
+    uint64_t d8;
+    uint64_t d9;
+    uint64_t d10;
+    uint64_t d11;
+    uint64_t d12;
+    uint64_t d13;
+    uint64_t d14;
+    uint64_t d15;
+} __attribute__((aligned(16)));
+
 #else
 #error "Unsupported architecture"
 #endif
@@ -204,6 +238,7 @@ KHASH_MAP_INIT_INT(tqueue, queue_tid_t)
 
 uint64_t    sched_switch_ctx(struct context *save, struct context *restore, uint64_t retval, void *arg);
 void        sched_task_exit_trampoline(void);
+void        sched_task_entry_trampoline(void);
 void        sched_task_exit(struct result ret);
 static void sched_task_cleanup(const struct task *task);
 
@@ -368,6 +403,21 @@ static void sched_init_ctx(struct task *task, void *code)
      * returning from the task function. This routine
      * is responsible for context-switching out of the 
      * task context. */
+#if defined(__aarch64__)
+    /* AArch64 entry goes through sched_task_entry_trampoline (see
+     * context_switch.S): the switch leaves the task argument in x17 and
+     * reads the entry address from x19. ASan fiber switching is not
+     * implemented for AArch64 yet. */
+    stack_base -= 8;
+    *(uint64_t*)stack_base = (uintptr_t)sched_task_exit_trampoline;
+
+    stack_base -= 8;
+    *(uint64_t*)stack_base = (uintptr_t)sched_task_entry_trampoline;
+
+    memset(&task->ctx, 0, sizeof(task->ctx));
+    task->ctx.rsp = (uintptr_t)stack_base;
+    task->ctx.x19 = (uintptr_t)code;
+#else
     stack_base -= 8;
     *(uint64_t*)stack_base = (uintptr_t)sched_task_exit_trampoline;
 
@@ -383,6 +433,7 @@ static void sched_init_ctx(struct task *task, void *code)
 
     memset(&task->ctx, 0, sizeof(task->ctx));
     task->ctx.rsp = (uintptr_t)stack_base;
+#endif
 
     /* +-------------------------------------------------------------------+
      * | Register[bits] | Setting                                          |
@@ -428,6 +479,8 @@ static inline uint64_t sched_get_sp(void)
     uint64_t sp;
 #ifdef _MSC_VER
     sp = 0;
+#elif defined(__aarch64__)
+    __asm__("mov %0, sp" : "=r" (sp));
 #else
     __asm__("mov %%rsp, %0" : "=rm" (sp));
 #endif
@@ -451,7 +504,11 @@ static inline uint64_t sched_get_retaddr(void)
 {
     uint64_t rbp;
 #ifndef _MSC_VER
+#if defined(__aarch64__)
+    __asm__("mov %0, x29" : "=r" (rbp));
+#else
     __asm__("mov %%rbp, %0" : "=rm" (rbp));
+#endif
 #endif
     return *(((uint64_t*)(rbp)) + 1);
 }
@@ -474,8 +531,13 @@ static inline void sched_print_backtrace(void)
     rip = 0xdeadbeef;
     rbp = ((uint64_t*)_AddressOfReturnAddress()) - 1;
 #else
+#if defined(__aarch64__)
+    __asm__("adr %0, ." : "=r" (rip));
+    __asm__("mov %0, x29" : "=r" (rbp));
+#else
     __asm__("lea 0x0(%%rip), %0\n" : "=rm" (rip));
     __asm__("mov %%rbp, %0" : "=rm" (rbp));
+#endif
 #endif
 
     printf("#0  0x%016" PRIx64 "\n", rip);

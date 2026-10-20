@@ -56,7 +56,7 @@
 #include "../phys/public/collision.h"
 #include "../game/public/game.h"
 
-#include <GL/glew.h>
+#include "pf_gl.h"
 #include <SDL.h>
 #include <assert.h>
 

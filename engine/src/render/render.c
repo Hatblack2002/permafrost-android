@@ -61,7 +61,7 @@
 #include <setjmp.h>
 
 #include <SDL.h>
-#include <GL/glew.h>
+#include "pf_gl.h"
 #include <SDL_opengl.h>
 #include <mimalloc-stats.h>
 
@@ -407,6 +407,12 @@ static void render_init_ctx(struct render_init_arg *arg)
 {
     SDL_GL_MakeCurrent(arg->in_window, s_context);
 
+#if defined(__ANDROID__)
+    /* The GLES 3.2 context is created by SDL/EGL before this point; there
+     * is no GL loader to initialize on Android. The required feature set
+     * is enforced by the manifest (glEsVersion 0x00030002) and validated
+     * on device per the port acceptance criteria. */
+#else
     glewExperimental = GL_TRUE;
     if(glewInit() != GLEW_OK) {
         fprintf(stderr, "Failed to initialize GLEW\n");
@@ -419,12 +425,22 @@ static void render_init_ctx(struct render_init_arg *arg)
         arg->out_success = false;
         return;
     }
+#endif
 
+#if defined(__ANDROID__)
+    /* KHR_debug is core in OpenGL ES 3.2 (pf_gl.h: PF_GL_HAS_KHR_DEBUG). */
+    if(PF_GL_HAS_KHR_DEBUG) {
+        glEnable(GL_DEBUG_OUTPUT);
+        glEnable(GL_DEBUG_OUTPUT_SYNCHRONOUS);
+        glDebugMessageCallback(debug_callback, NULL);
+    }
+#else
     if(GLEW_KHR_debug) {
         glEnable(GL_DEBUG_OUTPUT);
         glEnable(GL_DEBUG_OUTPUT_SYNCHRONOUS);
         glDebugMessageCallback(debug_callback, NULL);
     }
+#endif
 
     int vp[4] = {0 ,0, arg->in_width, arg->in_height};
     R_GL_SetViewport(&vp[0], &vp[1], &vp[2], &vp[3]);
@@ -987,9 +1003,15 @@ const char *R_GetInfo(enum render_info attr)
 
 void R_InitAttributes(void)
 {
+#if defined(__ANDROID__)
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_ES);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 2);
+#else
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_CORE);
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 3);
+#endif
     SDL_GL_SetAttribute(SDL_GL_ACCELERATED_VISUAL, 1);
 
     SDL_GL_SetAttribute(SDL_GL_RED_SIZE, 8);
@@ -1009,10 +1031,17 @@ void R_InitAttributes(void)
 
 bool R_ComputeShaderSupported(void)
 {
+#if defined(__ANDROID__)
+    /* Compute shaders and SSBOs are core in GLES 3.1; the port targets
+     * GLES 3.2. Persistent buffer storage is provided by
+     * GL_EXT_buffer_storage (pf_gl.h: PF_GL_HAS_BUFFER_STORAGE). */
+    return true;
+#else
     /* The movement solve's buffers are persistently mapped */
     return (GLEW_VERSION_4_4
         || (GLEW_ARB_compute_shader && GLEW_ARB_shader_storage_buffer_object
             && GLEW_ARB_buffer_storage));
+#endif
 }
 
 void R_Yield(void)

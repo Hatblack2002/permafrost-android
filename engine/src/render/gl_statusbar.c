@@ -51,7 +51,7 @@
 #include "../lib/public/pf_string.h"
 #include "../mem.h"
 
-#include <GL/glew.h>
+#include "pf_gl.h"
 #include <assert.h>
 
 #undef PF_MALLOC

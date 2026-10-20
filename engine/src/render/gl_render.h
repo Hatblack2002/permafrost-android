@@ -40,7 +40,7 @@
 #include "../map/public/tile.h"
 #include "../pf_math.h"
 
-#include <GL/glew.h>
+#include "pf_gl.h"
 
 #include <stddef.h>
 #include <stdbool.h>

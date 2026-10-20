@@ -36,7 +36,7 @@
 #ifndef GL_BATCH_H
 #define GL_BATCH_H
 
-#include <GL/glew.h>
+#include "pf_gl.h"
 #include <stdbool.h>
 
 struct render_input;

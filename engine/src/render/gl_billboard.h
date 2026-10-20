@@ -42,7 +42,7 @@
 
 #include <stdint.h>
 #include <SDL_atomic.h>
-#include <GL/glew.h>
+#include "pf_gl.h"
 
 #define BB_CACHE_NAME_LEN (256)
 
