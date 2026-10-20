@@ -1012,6 +1012,14 @@ int main(int argc, char **argv)
     engine_shutdown();
 fail_init:
 fail_args:
+#ifdef __ANDROID__
+    /* Android: returning lets the boot glue (android/app/jni/src/
+     * pf_android_main.c) surface a boot report (on-screen dialog + boot-
+     * report.txt) before the SDL thread finishes the activity. exit()
+     * here would tear the process down with no user-visible feedback. */
+    return ret;
+#else
     exit(ret);
+#endif
 }
 

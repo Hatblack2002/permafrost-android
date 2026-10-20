@@ -327,6 +327,18 @@ void LoadingScreen_DrawEarly(SDL_Window *window)
     if(!s_early_loading_screen)
         return;
 
+#ifdef __ANDROID__
+    /* Android: SDL_GetWindowSurface() on an SDL_WINDOW_OPENGL window is
+     * routed through the texture-framebuffer fallback (SDL_CreateWindow-
+     * Texture), which spins up a 2D renderer (and, on Android, an extra
+     * EGL context) on the very ANativeWindow the engine is about to own
+     * with its own GLES 3.2 context. There is no software window surface
+     * to draw to here. Skip the pre-GL draw; the real loading screen
+     * comes up through R_GL_DrawLoadingScreen once the render thread is
+     * live. (Desktop keeps the software early draw below.) */
+    return;
+#endif
+
     SDL_Surface *win_surface = SDL_GetWindowSurface(window);
     SDL_Renderer *sw_renderer = SDL_CreateSoftwareRenderer(win_surface);
     assert(sw_renderer);

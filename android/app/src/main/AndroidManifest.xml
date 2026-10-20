@@ -13,10 +13,11 @@
         android:allowBackup="false"
         android:theme="@android:style/Theme.NoTitleBar.Fullscreen">
 
-        <!-- SDL2's SDLActivity boots the native code; getLibraries() loads
-             "SDL2" and then "main". -->
+        <!-- PFActivity (subclass of SDL2's SDLActivity) boots the native
+             code; getLibraries() loads "SDL2" and then "main", and adds
+             the on-screen boot report for failed engine boots. -->
         <activity
-            android:name="org.libsdl.app.SDLActivity"
+            android:name="io.github.hatblack2002.permafrost.PFActivity"
             android:label="@string/app_name"
             android:exported="true"
             android:screenOrientation="fullSensor"

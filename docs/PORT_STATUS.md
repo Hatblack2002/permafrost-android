@@ -116,3 +116,43 @@ Remaining blockers, in order:
    and shader packaging into APK assets, basepath resolution on Android.
 3. On-device acceptance of the shell APK (Galaxy S20 FE), then engine
    boot validation; shader 430/SSBO and S3TC-compression runtime checks.
+
+### 2026-10-20 — v0.2.1: on-device boot diagnostics (black box)
+
+First on-device install of the v0.2.0 game APK closed immediately on
+tap. That is consistent with an engine_init() failure path reaching
+`exit(ret)` (silently tearing down the process), or an early native
+fault — with no adb on hand, nothing was observable.
+
+Changes (v0.2.1-bootdiag, versionCode 3):
+
+- **On-screen boot report, no adb needed**: `pf_android_main.c` captures
+  every SDL_Log line plus the engine's own stdout/stderr (fprintf) into
+  an in-memory ring buffer. A non-zero engine exit renders the last
+  ~110 lines on screen (PFActivity.showBootReport via JNI, "Copiar
+  registro" clipboard button) and writes
+  `<ext-files>/boot-report.txt`. `engine/src/main.c` now returns the
+  exit code on Android instead of calling exit(), so the glue can
+  surface the report before the SDL thread finishes the activity.
+- **Fatal-signal capture**: SIGABRT/SEGV/BUS/ILL/FPE handlers record
+  the fault address + aarch64 frame-pointer chain into the ring buffer,
+  logcat (tag `pf-boot`) and a pre-opened
+  `<ext-files>/boot-report-fatal.txt` (write() only, async-signal-safe),
+  then re-raise for the standard tombstone.
+- **LoadingScreen_DrawEarly Android guard**: SDL_GetWindowSurface() on
+  an SDL_WINDOW_OPENGL window routes through SDL's texture-framebuffer
+  fallback on Android (extra 2D renderer/EGL context on the ANativeWindow
+  the engine is about to own). The pre-GL software draw is skipped on
+  Android; the GL loading screen takes over once the render thread runs.
+- **Full Python 2.7 stdlib packaged**: the game scripts' transitive
+  imports (traceback→linecache→os, inspect→dis/imp, doctest→unittest,
+  re, ...) go beyond the earlier hand-picked mini-stdlib; the workflow
+  now ships the pure-Python Lib tree (dev subpackages pruned) under
+  scripts/lib/python2.7, matching desktop path semantics (engine
+  scripts/stdlib still appended after the default path by S_Init).
+
+Acceptance gate for this build: install, tap, and either read the
+on-screen boot report or pull `<ext>/boot-report.txt`. If the process
+dies via fatal signal, the report file still contains the captured
+trail. Native symbols are retained in the debug APK (debugSymbolLevel
+SYMBOL_TABLE) for address→symbol mapping against libmain.so.

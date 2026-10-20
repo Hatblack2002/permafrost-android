@@ -99,25 +99,33 @@ jobs:
             engine/shaders android/app/src/main/assets/pf/shaders
 
       # The embedded interpreter resolves PYTHONHOME=<basepath>/scripts
-      # and therefore looks for its codec packages under
-      # scripts/lib/python2.7. Ship the minimal set the engine's scripts
-      # need (codecs + encodings); everything else comes from the
-      # engine's own scripts/stdlib.
-      - name: Package Python scripts and mini-stdlib
+      # and therefore looks for its stdlib under scripts/lib/python2.7.
+      # Ship the FULL pure-Python Lib tree (minus dev-only subpackages):
+      # the engine's game scripts transitively import modules beyond the
+      # earlier hand-picked mini-stdlib (traceback -> linecache -> os,
+      # inspect -> dis/imp, doctest -> unittest, re, ...), and any
+      # ImportError there aborts the boot. Same semantics as desktop:
+      # S_Init appends the engine's scripts/stdlib AFTER the default
+      # path, so engine stdlib overrides behave exactly as upstream.
+      - name: Package Python scripts and standard library
         run: |
           set -e
           A=android/app/src/main/assets/pf
           mkdir -p "$A"
           cp -r engine/scripts "$A/scripts"
-          mkdir -p "$A/scripts/lib/python2.7/encodings"
-          cp engine/deps/Python/Lib/codecs.py "$A/scripts/lib/python2.7/"
-          cp engine/deps/Python/Lib/encodings/__init__.py \
-             engine/deps/Python/Lib/encodings/aliases.py \
-             engine/deps/Python/Lib/encodings/ascii.py \
-             engine/deps/Python/Lib/encodings/latin_1.py \
-             engine/deps/Python/Lib/encodings/utf_8.py \
-             engine/deps/Python/Lib/encodings/utf_8_sig.py \
-             "$A/scripts/lib/python2.7/encodings/"
+          mkdir -p "$A/scripts/lib/python2.7"
+          rsync -a \
+            --exclude='test' --exclude='tests' \
+            --exclude='lib2to3' --exclude='idlelib' \
+            --exclude='distutils' --exclude='site-packages' \
+            --exclude='bsddb' --exclude='curses' \
+            --exclude='*.pyc' --exclude='*.pyo' \
+            engine/deps/Python/Lib/ "$A/scripts/lib/python2.7/"
+          du -sh "$A/scripts/lib/python2.7"
+          test -f "$A/scripts/lib/python2.7/os.py"
+          test -f "$A/scripts/lib/python2.7/re.py"
+          test -f "$A/scripts/lib/python2.7/inspect.py"
+          test -f "$A/scripts/lib/python2.7/encodings/utf_8.py"
 
       # Game data: everything under engine/assets except the Blender
       # source files (63 MB of dev-only content inside models/).
