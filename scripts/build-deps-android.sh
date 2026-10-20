@@ -188,6 +188,17 @@ cp "$WORK/py-arm/pyconfig.h" "$STAGE/prebuilt/python/pyconfig.h"
 echo "=== [3/3] mimalloc + OpenAL Soft (CMake, arm64) ==="
 TCFILE="$NDK/build/cmake/android.toolchain.cmake"
 
+# openal-soft 1.21.1 typo (fixed upstream in 1.22+): the const& overload
+# of operator* dereferences this->mValue, but the value lives in
+# mStore.mValue. Newer clang's two-phase lookup rejects it. Patch a copy
+# so the vendored tree stays pristine.
+cp -r "$REPO_ROOT/engine/deps/openal-soft" "$WORK/oal-src"
+OAL_ALOPT="$WORK/oal-src/common/aloptional.h"
+sed -i 's|return this->mValue; }|return mStore.mValue; }|' "$OAL_ALOPT"
+grep -q 'return mStore.mValue' "$OAL_ALOPT" || {
+    echo "error: aloptional.h operator* patch did not apply" >&2; exit 1;
+}
+
 cmake -S "$REPO_ROOT/engine/deps/mimalloc" -B "$WORK/mi" \
     -DCMAKE_TOOLCHAIN_FILE="$TCFILE" \
     -DANDROID_ABI="$ABI" -DANDROID_PLATFORM="android-$API" \
@@ -200,7 +211,7 @@ MI_LIB="$(find "$WORK/mi" -name 'libmimalloc.a' | head -n1)"
 [ -n "$MI_LIB" ] || { echo "error: libmimalloc.a not produced" >&2; exit 1; }
 cp "$MI_LIB" "$STAGE/prebuilt/mimalloc/libmimalloc.a"
 
-cmake -S "$REPO_ROOT/engine/deps/openal-soft" -B "$WORK/oal" \
+cmake -S "$WORK/oal-src" -B "$WORK/oal" \
     -DCMAKE_TOOLCHAIN_FILE="$TCFILE" \
     -DANDROID_ABI="$ABI" -DANDROID_PLATFORM="android-$API" \
     -DCMAKE_BUILD_TYPE=Release \
