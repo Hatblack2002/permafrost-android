@@ -300,7 +300,15 @@ def guard_plain_functions(path, close_attr, dispatches):
     runtime dispatch statements.
     """
     text = path.read_text()
+    # Normalize guards emitted by the first (buggy) CI application, which
+    # used the attribute macro itself as the #if expression. Only this
+    # patch script inserts those lines, so the rewrite is unambiguous.
+    text = text.replace("#if SIMD_TARGET_AVX2\n",
+                        "#if SIMD_HAS_TARGET_AVX2\n")
+    text = text.replace("#if SIMD_TARGET_AVX512F\n",
+                        "#if SIMD_HAS_TARGET_AVX512F\n")
     if "#if SIMD_HAS_TARGET_AVX2" in text:
+        path.write_text(text)
         print(f"{path}: SIMD guards already applied")
         return
     lines = text.split("\n")
@@ -323,7 +331,10 @@ def guard_plain_functions(path, close_attr, dispatches):
 
     for i_start, i_end, attr in sorted(spans, key=lambda s: s[0], reverse=True):
         lines.insert(i_end + 1, "#endif")
-        lines.insert(i_start, "#if " + attr)
+        # Guard on the compile-time availability flag (SIMD_HAS_TARGET_*),
+        # not on the attribute macro itself: SIMD_TARGET_* expands to an
+        # attribute (or nothing), which is not a valid #if expression.
+        lines.insert(i_start, "#if SIMD_HAS" + attr[4:])
     text = "\n".join(lines)
 
     for old, new in dispatches:
