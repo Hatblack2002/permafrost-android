@@ -34,11 +34,34 @@ jobs:
           # can syntax-check it with the aarch64 define forced on).
           gcc -fsyntax-only -D__aarch64__ sched_ctx_offsets.c
 
+      - name: Locate ndk-build (fail hard if missing)
+        id: ndk
+        run: |
+          set -euo pipefail
+          for cand in "${ANDROID_NDK_HOME:-}" "${ANDROID_NDK_LATEST_HOME:-}" \
+                      /usr/local/lib/android/sdk/ndk-bundle; do
+            if [ -n "$cand" ] && [ -x "$cand/ndk-build" ]; then
+              echo "ndk-build=$cand/ndk-build" >> "$GITHUB_OUTPUT"
+              echo "Using ndk-build at $cand/ndk-build"
+              exit 0
+            fi
+          done
+          # Last resort: newest NDK installed under the Android SDK dir.
+          found=$(ls /usr/local/lib/android/sdk/ndk/*/ndk-build 2>/dev/null \
+                    | sort -V | tail -1 || true)
+          if [ -n "$found" ]; then
+            echo "ndk-build=$found" >> "$GITHUB_OUTPUT"
+            echo "Using ndk-build at $found"
+            exit 0
+          fi
+          echo "::error::ndk-build not found on runner; report would be empty"
+          exit 1
+
       - name: Compile engine sources for arm64-v8a (keep-going)
         working-directory: android/app/jni
         run: |
           set +e
-          "$ANDROID_NDK_HOME/ndk-build" -k -B \
+          "${{ steps.ndk.outputs.ndk-build }}" -k -B \
             NDK_PROJECT_PATH=. \
             NDK_APPLICATION_MK=Application.mk \
             APP_BUILD_SCRIPT=Android-engine.mk \
@@ -47,6 +70,28 @@ jobs:
           status=$?
           echo "ndk-build exit status: $status"
           cp compile.log "$GITHUB_WORKSPACE/engine-compile.log"
+
+      - name: Guard against an empty/false-positive report
+        working-directory: android/app/jni
+        run: |
+          set -euo pipefail
+          # The report workflow intentionally survives compile errors
+          # (ndk-build -k), but it must NOT "succeed" if compilation never
+          # actually happened (bad makefile, wrong NDK root, empty log).
+          if [ ! -s compile.log ]; then
+            echo "::error::compile.log is empty; ndk-build produced no output"
+            exit 1
+          fi
+          compiles=$(grep -c '\[arm64-v8a\] Compile' compile.log || true)
+          errors=$(grep -c 'error:' compile.log || true)
+          echo "compile actions: $compiles, error diagnostics: $errors"
+          if [ "$compiles" -eq 0 ] && [ "$errors" -eq 0 ]; then
+            echo "::error::no '[arm64-v8a] Compile' lines and no errors in log;"
+            echo "::error::ndk-build likely failed before compiling any file."
+            tail -30 compile.log
+            exit 1
+          fi
+          echo "engine C sources compiled or attempted: OK"
 
       - name: Summarize per-file compile evidence
         run: |

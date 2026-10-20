@@ -14,7 +14,11 @@
 #             APP_BUILD_SCRIPT=Android-engine.mk
 LOCAL_PATH := $(call my-dir)
 
-PF_ROOT := $(LOCAL_PATH)/../../engine
+# Three levels up: this makefile lives in android/app/jni/, and the
+# vendored engine is at the repository root (engine/). With only two
+# levels the path resolves to android/engine, every wildcard comes back
+# empty and ndk-build exits instantly, producing an empty compile report.
+PF_ROOT := $(LOCAL_PATH)/../../../engine
 
 PF_SRCS := \
     $(wildcard $(PF_ROOT)/src/*.c) \

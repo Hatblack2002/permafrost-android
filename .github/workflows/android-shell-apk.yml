@@ -19,10 +19,19 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Set up JDK 17
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: '17'
+
+      # Pin Gradle: the ubuntu-latest image migrated to Ubuntu 26.04
+      # (2026-10-19) and now ships Gradle 9.8.1 + a JDK 25 default, neither
+      # of which is compatible with the pinned AGP 8.5.2. Gradle 8.9 is the
+      # version AGP 8.5.x is tested against.
+      - name: Pin Gradle 8.9 (AGP 8.5.2 compatible)
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
 
       - name: Build shell debug APK (SDL2 + GLES 3.2 smoke)
         working-directory: android
