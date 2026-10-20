@@ -1,0 +1,89 @@
+name: Apply Android port patches to vendored engine
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "scripts/patch-glew-gles.py"
+      - "scripts/patch-sched-arm64.py"
+      - "android/include/pf_gl.h"
+      - "android/port-src/pf_gl_android.c"
+      - "android/tests/sched_ctx_offsets.c"
+      - ".github/workflows/apply-android-port-patches.yml"
+
+permissions:
+  contents: write
+
+jobs:
+  apply-port-patches:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+
+      - name: Verify vendored upstream revision
+        shell: bash
+        run: |
+          source upstream.lock
+          test -f engine/src/render/render.c
+          test -f engine/src/sched.c
+          test -f engine/src/context_switch.S
+          grep -q "$UPSTREAM_REF" engine/UPSTREAM_SOURCE.txt
+
+      - name: Apply GLES portability and AArch64 scheduler patches
+        run: |
+          python3 scripts/patch-glew-gles.py engine
+          python3 scripts/patch-sched-arm64.py engine
+
+      - name: Verify patches are idempotent
+        run: |
+          python3 scripts/patch-glew-gles.py engine
+          python3 scripts/patch-sched-arm64.py engine
+          python3 - <<'PY'
+          from pathlib import Path
+          header = Path("android/include/pf_gl.h").read_text()
+          for copy in ["engine/src/render/pf_gl.h",
+                       "engine/src/pf_gl.h",
+                       "engine/src/lib/pf_gl.h"]:
+              if Path(copy).read_text() != header:
+                  raise SystemExit(f"{copy}: drifted from android/include/pf_gl.h")
+          glew_users = [p for p in Path("engine/src").rglob("*.c")]
+          glew_users += [p for p in Path("engine/src").rglob("*.h")]
+          bad = [str(p) for p in glew_users
+                 if p.name != "pf_gl.h" and "<GL/glew.h>" in p.read_text()]
+          if bad:
+              raise SystemExit(f"raw GLEW includes remain: {bad}")
+          asm = Path("engine/src/context_switch.S").read_text()
+          for marker in [
+              "sched_task_entry_trampoline:",
+              "Larm64_back:",
+              "#elif defined(__aarch64__)",
+          ]:
+              if marker not in asm:
+                  raise SystemExit(f"context_switch.S: missing {marker}")
+          if asm.count("sched_task_entry_trampoline:") != 1:
+              raise SystemExit("context_switch.S: entry trampoline duplicated")
+          sched = Path("engine/src/sched.c").read_text()
+          for marker in [
+              "uint64_t x19;",
+              "void        sched_task_entry_trampoline(void);",
+              "task->ctx.x19 = (uintptr_t)code;",
+          ]:
+              if marker not in sched:
+                  raise SystemExit(f"sched.c: missing {marker}")
+          print("GLES portability layer and AArch64 scheduler port verified.")
+          PY
+
+      - name: Commit adapted engine sources
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add engine/src engine/deps 2>/dev/null || git add engine/src
+          if git diff --cached --quiet; then
+            echo "Android port patches already applied."
+            exit 0
+          fi
+          git commit -m "android: GLES portability layer and AArch64 scheduler port [skip ci]"
+          git push origin HEAD:main

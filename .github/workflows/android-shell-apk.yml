@@ -1,0 +1,50 @@
+name: Android shell APK
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "android/**"
+      - "engine/deps/SDL2/android-project/**"
+      - ".github/workflows/android-shell-apk.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  shell-apk:
+    name: Build arm64-v8a shell debug APK
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Build shell debug APK (SDL2 + GLES 3.2 smoke)
+        working-directory: android
+        run: gradle assembleDebug --no-daemon --stacktrace
+
+      - name: Verify the APK was produced
+        run: |
+          test -f android/app/build/outputs/apk/debug/app-debug.apk
+          ls -la android/app/build/outputs/apk/debug/
+
+      - name: Upload shell debug APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: pf-android-shell-debug-apk
+          path: android/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+
+      - name: Report milestone scope
+        run: |
+          echo "### Shell smoke APK (Stage 2, step 1)" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "This artifact proves the SDL2 Android activity, the arm64-v8a" >> "$GITHUB_STEP_SUMMARY"
+          echo "native build and a GLES 3.2 context. It is **not** the engine." >> "$GITHUB_STEP_SUMMARY"
+          echo "Engine compilation evidence: see the android-engine-compile-report" >> "$GITHUB_STEP_SUMMARY"
+          echo "workflow." >> "$GITHUB_STEP_SUMMARY"

@@ -1,0 +1,107 @@
+name: Android engine compile report
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "android/app/jni/**"
+      - "android/tests/**"
+      - "scripts/patch-glew-gles.py"
+      - "scripts/patch-sched-arm64.py"
+      - "engine/src/**"
+      - ".github/workflows/android-engine-compile-report.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  engine-compile:
+    name: Compile engine for arm64-v8a (report, not a port claim)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Apply GLES portability and AArch64 scheduler patches in-place
+        run: |
+          python3 scripts/patch-glew-gles.py engine
+          python3 scripts/patch-sched-arm64.py engine
+
+      - name: Build AArch64 layout guard
+        working-directory: android/tests
+        run: |
+          # Offsets must match context_switch.S; compile with the guard's
+          # assertions active (arch-independent C, so the host compiler
+          # can syntax-check it with the aarch64 define forced on).
+          gcc -fsyntax-only -D__aarch64__ sched_ctx_offsets.c
+
+      - name: Compile engine sources for arm64-v8a (keep-going)
+        working-directory: android/app/jni
+        run: |
+          set +e
+          "$ANDROID_NDK_HOME/ndk-build" -k -B \
+            NDK_PROJECT_PATH=. \
+            NDK_APPLICATION_MK=Application.mk \
+            APP_BUILD_SCRIPT=Android-engine.mk \
+            NDK_OUT=obj-report \
+            > compile.log 2>&1
+          status=$?
+          echo "ndk-build exit status: $status"
+          cp compile.log "$GITHUB_WORKSPACE/engine-compile.log"
+
+      - name: Summarize per-file compile evidence
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+
+          log = Path("engine-compile.log").read_text(errors="replace")
+          # ndk-build prints "[abs]/path/to/file.c:line:col: error: ..."
+          failed = sorted(set(re.findall(
+              r"engine/src/[^\s:'\"]+?\.(?:c|S):\d+:\d+: error:", log)))
+          failed_files = sorted(set(m.split(":")[0] for m in failed))
+          srcs = []
+          for pat in ["*.c", "*/*.c", "*/*/*.c"]:
+              srcs += Path("engine/src").rglob(pat)
+          srcs = sorted(set(p for p in srcs
+                            if not p.name.startswith("py_")))
+          print("### Android engine compile report (arm64-v8a)")
+          print("")
+          print(f"- engine C sources considered: {len(srcs)} "
+                "(Python scripting subsystem excluded)")
+          print(f"- distinct files with compile errors: {len(failed_files)}")
+          print(f"- total error diagnostics: {len(failed)}")
+          if failed_files:
+              print("")
+              print("| file | errors |")
+              print("|------|--------|")
+              for f in failed_files:
+                  n = len([m for m in failed if m.startswith(f + ":")])
+                  print(f"| `{f}` | {n} |")
+          lines = ["## Android engine compile report (arm64-v8a)", "",
+                   f"engine C sources considered: {len(srcs)} "
+                   "(Python scripting subsystem excluded)",
+                   f"files with errors: {len(failed_files)}",
+                   f"total error diagnostics: {len(failed)}", ""]
+          lines += [f"- {f}" for f in failed_files]
+          Path("compile-summary.md").write_text("\n".join(lines) + "\n")
+          PY
+
+      - name: Append summary to job summary
+        if: always()
+        run: cat compile-summary.md >> "$GITHUB_STEP_SUMMARY" || true
+
+      - name: Upload compile log and summary
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pf-engine-arm64-compile-report
+          path: |
+            engine-compile.log
+            compile-summary.md
+          if-no-files-found: error
+
+      - name: Evidence disclaimer
+        if: always()
+        run: |
+          echo "A compiled file is compile-level evidence only. It does not" >> "$GITHUB_STEP_SUMMARY"
+          echo "claim the engine links, launches, or renders on a device." >> "$GITHUB_STEP_SUMMARY"
