@@ -1,0 +1,223 @@
+/*
+ *  This file is part of Permafrost Engine. 
+ *  Copyright (C) 2018-2023 Eduard Permyakov 
+ *
+ *  Permafrost Engine is free software: you can redistribute it and/or modify
+ *  it under the terms of the GNU General Public License as published by
+ *  the Free Software Foundation, either version 3 of the License, or
+ *  (at your option) any later version.
+ *
+ *  Permafrost Engine is distributed in the hope that it will be useful,
+ *  but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *  GNU General Public License for more details.
+ *
+ *  You should have received a copy of the GNU General Public License
+ *  along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ * 
+ *  Linking this software statically or dynamically with other modules is making 
+ *  a combined work based on this software. Thus, the terms and conditions of 
+ *  the GNU General Public License cover the whole combination. 
+ *  
+ *  As a special exception, the copyright holders of Permafrost Engine give 
+ *  you permission to link Permafrost Engine with independent modules to produce 
+ *  an executable, regardless of the license terms of these independent 
+ *  modules, and to copy and distribute the resulting executable under 
+ *  terms of your choice, provided that you also meet, for each linked 
+ *  independent module, the terms and conditions of the license of that 
+ *  module. An independent module is a module which is not derived from 
+ *  or based on Permafrost Engine. If you modify Permafrost Engine, you may 
+ *  extend this exception to your version of Permafrost Engine, but you are not 
+ *  obliged to do so. If you do not wish to do so, delete this exception 
+ *  statement from your version.
+ *
+ */
+
+#ifndef EVENT_H
+#define EVENT_H
+
+#include "script/public/script.h"
+
+#include <SDL_events.h>
+#include <stdbool.h>
+
+
+enum eventtype{
+    /*
+     * +-----------------+-----------------------------------------------+
+     * | Range           | Use                                           |
+     * +-----------------+-----------------------------------------------+
+     * | 0x0-0xffff      | SDL events                                    |
+     * +-----------------+-----------------------------------------------+
+     * | 0x10000-0x1ffff | Engine-generated events                       |
+     * +-----------------+-----------------------------------------------+
+     * | 0x20000-0x2ffff | Script-generated events                       |
+     * +-----------------+-----------------------------------------------+
+     *
+     * The very first event serviced during a tick is a single EVENT_UPDATE_START one.
+     * The very last event serviced during a tick is a single EVENT_UPDATE_END one. 
+     */
+    EVENT_UPDATE_START = SDL_LASTEVENT + 1,
+    EVENT_UPDATE_END,
+    EVENT_UPDATE_UI,
+    EVENT_RENDER_3D_PRE,
+    EVENT_RENDER_3D_POST,
+    EVENT_RENDER_UI,
+    EVENT_RENDER_FINISH,
+    EVENT_SELECTED_TILE_CHANGED,
+    EVENT_NEW_GAME,
+    EVENT_UNIT_SELECTION_CHANGED,
+    EVENT_60HZ_TICK,
+    EVENT_30HZ_TICK,
+    EVENT_20HZ_TICK,
+    EVENT_15HZ_TICK,
+    EVENT_10HZ_TICK,
+    EVENT_5HZ_TICK,
+    EVENT_1HZ_TICK,
+    EVENT_HALFHZ_TICK,
+    EVENT_ANIM_FINISHED,
+    EVENT_ANIM_CYCLE_FINISHED,
+    EVENT_MOVE_ISSUED,
+    EVENT_MOTION_START,
+    EVENT_MOTION_END,
+    EVENT_ATTACK_START,
+    EVENT_ENTITY_DEATH,
+    EVENT_ENTITY_DEATH_IMMEDIATE,
+    EVENT_ATTACK_END,
+    EVENT_GAME_SIMSTATE_CHANGED,
+    EVENT_SESSION_LOADED,
+    EVENT_SESSION_POPPED,
+    EVENT_SESSION_SAVED,
+    EVENT_SESSION_FAIL_LOAD,
+    EVENT_SESSION_FAIL_SAVE,
+    EVENT_SCRIPT_TASK_EXCEPTION,
+    EVENT_SCRIPT_TASK_FINISHED,
+    EVENT_BUILD_BEGIN,
+    EVENT_BUILD_END,
+    EVENT_BUILD_FAIL_FOUND,
+    EVENT_BUILD_TARGET_ACQUIRED,
+    EVENT_BUILDING_FOUNDED,
+    EVENT_BUILDING_COMPLETED,
+    EVENT_BUILDING_CONSTRUCTED,
+    EVENT_ENTITY_DIED,
+    EVENT_ENTITY_STOP,
+    EVENT_HARVEST_BEGIN,
+    EVENT_HARVEST_END,
+    EVENT_HARVEST_TARGET_ACQUIRED,
+    EVENT_TRANSPORT_TARGET_ACQUIRED,
+    EVENT_STORAGE_TARGET_ACQUIRED,
+    EVENT_STORAGE_SITE_AMOUNT_CHANGED,
+    EVENT_RESOURCE_DROPPED_OFF,
+    EVENT_RESOURCE_PICKED_UP,
+    EVENT_RESOURCE_EXHAUSTED,
+    EVENT_RESOURCE_AMOUNT_CHANGED,
+    EVENT_ENTERED_REGION,
+    EVENT_EXITED_REGION,
+    EVENT_UPDATE_FACTION,
+    EVENT_PROJECTILE_DISAPPEAR,
+    EVENT_PROJECTILE_HIT,
+    EVENT_ENTITY_DISAPPEARED,
+    EVENT_ORDER_ISSUED,
+    EVENT_MOVABLE_ENTITY_UNBLOCK,
+    EVENT_MOVABLE_ENTITY_BLOCK,
+    EVENT_BUILDING_PLACED,
+    EVENT_BUILDING_REMOVED,
+    EVENT_RALLY_POINT_SET,
+    EVENT_UNIT_BECAME_IDLE,
+    EVENT_UNIT_BECAME_ACTIVE,
+
+    EVENT_ENGINE_LAST = 0x1ffff,
+};
+
+enum event_source{
+    ES_ENGINE,
+    ES_SCRIPT,
+};
+
+typedef void (*handler_t)(void*, void*);
+
+struct script_handler{
+    enum eventtype  event;
+    uint32_t        id;
+    int             simmask;
+    script_opaque_t handler;
+    script_opaque_t arg;
+};
+
+/*###########################################################################*/
+/* EVENT GENERAL                                                             */
+/*###########################################################################*/
+
+bool        E_Init(void);
+void        E_ServiceQueue(void);
+/* Where the last E_ServiceQueue spent its time, in microseconds, by kind of
+ * event (enum e_time_bucket order).
+ */
+enum e_time_bucket{
+    E_TIME_UPDATE_START,
+    E_TIME_ENT_UPDATE_START,
+    E_TIME_60HZ,
+    E_TIME_30HZ,
+    E_TIME_20HZ,
+    E_TIME_10HZ,
+    E_TIME_5HZ,
+    E_TIME_1HZ,
+    E_TIME_ANIM,
+    E_TIME_SDL,
+    E_TIME_SCRIPT,
+    E_TIME_OTHER,
+    E_TIME_UPDATE_END,
+    E_TIME_NBUCKETS
+};
+void        E_LastServiceTimes(uint64_t out_us[E_TIME_NBUCKETS]);
+void        E_Shutdown(void);
+void        E_DeleteScriptHandlers(void);
+size_t      E_GetScriptHandlers(size_t max_out, struct script_handler *out);
+void        E_ClearPendingEvents(void);
+void        E_FlushEventQueue(void);
+const char *E_EngineEventString(enum eventtype event);
+bool        E_EventsQueued(void);
+bool        E_QueuedThisFrame(enum eventtype event);
+
+/*###########################################################################*/
+/* EVENT GLOBAL                                                              */
+/*###########################################################################*/
+
+void E_Global_Notify(enum eventtype event, void *event_arg, enum event_source);
+void E_Global_NotifyImmediate(enum eventtype event, void *event_arg, enum event_source);
+
+bool E_Global_RegisterNamed(enum eventtype event, handler_t handler, void *user_arg,
+                            int simmask, const char *fname);
+bool E_Global_Unregister(enum eventtype event, handler_t handler);
+
+/* Captures the handler symbol name for perf-marker attribution */
+#define E_Global_Register(event, handler, user_arg, simmask) \
+    E_Global_RegisterNamed((event), (handler), (user_arg), (simmask), __FILE__ "::" #handler)
+
+bool E_Global_ScriptRegister(enum eventtype event, script_opaque_t handler, 
+                             script_opaque_t user_arg, int simmask);
+bool E_Global_ScriptUnregister(enum eventtype event, script_opaque_t handler);
+
+
+/*###########################################################################*/
+/* EVENT ENTITY                                                              */
+/*###########################################################################*/
+
+bool E_Entity_RegisterNamed(enum eventtype event, uint32_t ent_uid, handler_t handler,
+                            void *user_arg, int simmask, const char *fname);
+bool E_Entity_Unregister(enum eventtype event, uint32_t ent_uid, handler_t handler);
+
+#define E_Entity_Register(event, ent_uid, handler, user_arg, simmask) \
+    E_Entity_RegisterNamed((event), (ent_uid), (handler), (user_arg), (simmask), __FILE__ "::" #handler)
+
+bool E_Entity_ScriptRegister(enum eventtype event, uint32_t ent_uid, 
+                             script_opaque_t handler, script_opaque_t user_arg, int simmask);
+bool E_Entity_ScriptUnregister(enum eventtype event, uint32_t ent_uid, 
+                               script_opaque_t handler);
+bool E_Entity_HasHandler(enum eventtype event, uint32_t ent_uid);
+void E_Entity_Notify(enum eventtype, uint32_t ent_uid, void *event_arg, enum event_source);
+void E_Entity_NotifyImmediate(enum eventtype event, uint32_t ent_uid, void *event_arg, 
+                              enum event_source source);
+
+#endif
+

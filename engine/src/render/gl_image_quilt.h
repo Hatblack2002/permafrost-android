@@ -1,0 +1,64 @@
+/*
+ *  This file is part of Permafrost Engine. 
+ *  Copyright (C) 2024 Eduard Permyakov 
+ *
+ *  Permafrost Engine is free software: you can redistribute it and/or modify
+ *  it under the terms of the GNU General Public License as published by
+ *  the Free Software Foundation, either version 3 of the License, or
+ *  (at your option) any later version.
+ *
+ *  Permafrost Engine is distributed in the hope that it will be useful,
+ *  but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *  GNU General Public License for more details.
+ *
+ *  You should have received a copy of the GNU General Public License
+ *  along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ * 
+ *  Linking this software statically or dynamically with other modules is making 
+ *  a combined work based on this software. Thus, the terms and conditions of 
+ *  the GNU General Public License cover the whole combination. 
+ *  
+ *  As a special exception, the copyright holders of Permafrost Engine give 
+ *  you permission to link Permafrost Engine with independent modules to produce 
+ *  an executable, regardless of the license terms of these independent 
+ *  modules, and to copy and distribute the resulting executable under 
+ *  terms of your choice, provided that you also meet, for each linked 
+ *  independent module, the terms and conditions of the license of that 
+ *  module. An independent module is a module which is not derived from 
+ *  or based on Permafrost Engine. If you modify Permafrost Engine, you may 
+ *  extend this exception to your version of Permafrost Engine, but you are not 
+ *  obliged to do so. If you do not wish to do so, delete this exception 
+ *  statement from your version.
+ *
+ */
+
+#ifndef GL_IMAGE_QUILT_H
+#define GL_IMAGE_QUILT_H
+
+#include <GL/glew.h>
+#include <stdbool.h>
+
+struct texture_arr;
+struct texture;
+
+/* A baked map tileset has one array layer per Wang tile plus a final layer that
+ * packs the four per-direction minimum-error edge-seam masks (R=north, G=east,
+ * B=south, A=west) consumed by BLEND_MODE_EDGE. */
+#define TILESET_WANG_TILES  (8)
+#define TILESET_NUM_TILES   (TILESET_WANG_TILES + 1)
+
+bool   R_GL_ImageQuilt_MakeTile(const char *source, struct texture *out, GLuint tunit);
+bool   R_GL_ImageQuilt_MakeTileset(const char *source, struct texture_arr *out, GLuint tunit);
+
+/* Like MakeTileset, but also quilts a paired normal map ('normal') with the same
+ * blocks/seams into 'out_norm'. If 'normal' is missing/mismatched, out_norm->id is
+ * left 0 and only the diffuse tileset is produced. */
+bool   R_GL_ImageQuilt_MakeTilesetN(const char *diffuse, const char *normal,
+                                    struct texture_arr *out, struct texture_arr *out_norm,
+                                    GLuint tunit, GLuint tunit_norm);
+
+size_t R_GL_ImageQuilt_TilesetDim(void);
+
+#endif
+

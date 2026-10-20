@@ -1,0 +1,1028 @@
+/*
+ *  This file is part of Permafrost Engine. 
+ *  Copyright (C) 2018-2023 Eduard Permyakov 
+ *
+ *  Permafrost Engine is free software: you can redistribute it and/or modify
+ *  it under the terms of the GNU General Public License as published by
+ *  the Free Software Foundation, either version 3 of the License, or
+ *  (at your option) any later version.
+ *
+ *  Permafrost Engine is distributed in the hope that it will be useful,
+ *  but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *  GNU General Public License for more details.
+ *
+ *  You should have received a copy of the GNU General Public License
+ *  along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ * 
+ *  Linking this software statically or dynamically with other modules is making 
+ *  a combined work based on this software. Thus, the terms and conditions of 
+ *  the GNU General Public License cover the whole combination. 
+ *  
+ *  As a special exception, the copyright holders of Permafrost Engine give 
+ *  you permission to link Permafrost Engine with independent modules to produce 
+ *  an executable, regardless of the license terms of these independent 
+ *  modules, and to copy and distribute the resulting executable under 
+ *  terms of your choice, provided that you also meet, for each linked 
+ *  independent module, the terms and conditions of the license of that 
+ *  module. An independent module is a module which is not derived from 
+ *  or based on Permafrost Engine. If you modify Permafrost Engine, you may 
+ *  extend this exception to your version of Permafrost Engine, but you are not 
+ *  obliged to do so. If you do not wish to do so, delete this exception 
+ *  statement from your version.
+ *
+ */
+
+#ifndef MAP_H
+#define MAP_H
+
+#include "../../pf_math.h"
+#include "../../navigation/public/nav.h" /* dest_id_t */
+
+#include <stdio.h>
+#include <stdbool.h>
+
+#include <SDL.h> /* for SDL_RWops */
+
+#define MINIMAP_BORDER_WIDTH    (3.0f)
+#define MAX_HEIGHT_LEVEL        (9)
+#define MAX_MAP_TEXTURES        (256)
+
+struct pfchunk;
+struct pfmap_hdr;
+struct map;
+struct camera;
+struct tile;
+struct tile_desc;
+struct obb;
+enum render_pass;
+struct map_resolution;
+struct fc_stats;
+struct nav_unit_query_ctx;
+
+struct chunkpos{
+    int r, c;
+};
+
+struct splat{
+    unsigned base_mat_idx;
+    unsigned accent_mat_idx;
+};
+
+struct splatmap{
+    struct splat splats[MAX_MAP_TEXTURES];
+};
+
+/*###########################################################################*/
+/* MAP GENERAL                                                               */
+/*###########################################################################*/
+
+/* ------------------------------------------------------------------------
+ * Once per frame updates of the private map data.
+ * ------------------------------------------------------------------------
+ */
+void   M_Update(const struct map *map);
+
+/* ------------------------------------------------------------------------
+ * This renders all the chunks at once, which is wasteful when there are 
+ * many off-screen chunks. Depending on the 'pass' type, this will perform 
+ * a different rendering action.
+ * ------------------------------------------------------------------------
+ */
+void   M_RenderEntireMap(const struct map *map, bool shadows, enum render_pass pass);
+
+/* ------------------------------------------------------------------------
+ * Get the model matrix for a specific chunk.
+ * ------------------------------------------------------------------------
+ */
+void   M_ModelMatrixForChunk(const struct map *map, struct chunkpos p, mat4x4_t *out);
+
+/* ------------------------------------------------------------------------
+ * Renders the chunks of the map that are currently visible by the specified
+ * camera using a frustrum-chunk intersection test. Depending on the 'pass'
+ * type, this will perform a different action.
+ * ------------------------------------------------------------------------
+ */
+void   M_RenderVisibleMap(const struct map *map, const struct camera *cam,
+                          bool shadows, enum render_pass pass, bool near_water_only,
+                          const int *bake_layers);
+
+/* ------------------------------------------------------------------------
+ * Set a flag for every chunk telling if it intersects the camera frustum.
+ * ------------------------------------------------------------------------
+ */
+void   M_VisibleChunks(const struct map *map, const struct camera *cam, bool *out);
+
+/* ------------------------------------------------------------------------
+ * Render a layer over the visible map surface showing which regions are 
+ * pathable and which are not.
+ * ------------------------------------------------------------------------
+ */
+void   M_RenderVisiblePathableLayer(const struct map *map, const struct camera *cam,
+                                    enum nav_layer layer);
+
+/* ------------------------------------------------------------------------
+ * Render lines over the map surface showing the boudnaries between different 
+ * chunks.
+ * ------------------------------------------------------------------------
+ */
+void   M_RenderChunkBoundaries(const struct map *map, const struct camera *cam);
+
+/* ------------------------------------------------------------------------
+ * Render a layer over the visible map surface showing fields which guide
+ * units of a particular factions towards their enemies. These fields are
+ * used for combat target selection.
+ * ------------------------------------------------------------------------
+ */
+void   M_NavRenderVisibleEnemySeekField(const struct map *map, const struct camera *cam, 
+                                        enum nav_layer layer, int faction_id);
+
+/* ------------------------------------------------------------------------
+ * Debug rendering of a flock's shared arrival field (a goal-centred zone of
+ * open tiles), over every visible chunk.
+ * ------------------------------------------------------------------------
+ */
+void   M_NavRenderVisibleGroupArrivalField(const struct map *map, const struct camera *cam,
+                                           enum nav_layer layer, vec2_t centre_pos, uint16_t radius,
+                                           dest_id_t dest_id);
+
+/* ------------------------------------------------------------------------
+ * Debug rendering of fields that guide units to surround a specific target.
+ * ------------------------------------------------------------------------
+ */
+void   M_NavRenderVisibleSurroundField(const struct map *map, const struct camera *cam, 
+                                       enum nav_layer layer, uint32_t uid, float range);
+
+/* ------------------------------------------------------------------------
+ * Render a layer over the visible map surface showing which regions are 
+ * currently blocked by stationary entities.
+ * ------------------------------------------------------------------------
+ */
+void   M_NavRenderNavigationBlockers(const struct map *map, const struct camera *cam,
+                                     enum nav_layer layer);
+
+/* ------------------------------------------------------------------------
+ * Render a layer over the visible map surface showing which tiles under
+ * an object's OBB can currently be built on. The 'blocked' flag can be used
+ * to render all tiles as non-buildable.
+ * ------------------------------------------------------------------------
+ */
+void   M_NavRenderBuildableTiles(const struct map *map, const struct camera *cam, 
+                                 const struct obb *obb, enum nav_layer layer, 
+                                 bool blocked, bool allow_cliffs);
+
+/* ------------------------------------------------------------------------
+ * Render a layer over the visible map surface showing portals between chunks
+ * and their status.
+ * ------------------------------------------------------------------------
+ */
+void   M_NavRenderNavigationPortals(const struct map *map, const struct camera *cam,
+                                    enum nav_layer layer);
+
+/* ------------------------------------------------------------------------
+ * Debug rendering to show the 'cover' attribute of every map tile.
+ * ------------------------------------------------------------------------
+ */
+void   M_NavRenderMapCover(const struct map *map, const struct camera *cam);
+
+/* ------------------------------------------------------------------------
+ * Debug rendering to show the global island ID over every navigation tile.
+ * ------------------------------------------------------------------------
+ */
+void   M_NavRenderNavigationIslandIDs(const struct map *map, const struct camera *cam,
+                                      enum nav_layer layer);
+
+/* ------------------------------------------------------------------------
+ * Debug rendering to show the local island ID over every navigation tile.
+ * ------------------------------------------------------------------------
+ */
+void   M_NavRenderNavigationLocalIslandIDs(const struct map *map, const struct camera *cam,
+                                           enum nav_layer layer);
+
+/* ------------------------------------------------------------------------
+ * Set the pointer to the state which is used for making unit queries
+ * during field generation.
+ * ------------------------------------------------------------------------
+ */
+void   M_NavSetNavUnitQueryCtx(struct map *map, struct nav_unit_query_ctx *ctx);
+
+/* ------------------------------------------------------------------------
+ * Centers the map at the worldspace origin.
+ * ------------------------------------------------------------------------
+ */
+void   M_CenterAtOrigin     (struct map *map);
+
+/* ------------------------------------------------------------------------
+ * Sets an XZ bounding box for the camera such that the XZ coordinate of 
+ * the intersection of the camera ray with the ground plane is always 
+ * within the map area.
+ * ------------------------------------------------------------------------
+ */
+void   M_RestrictRTSCamToMap(const struct map *map, struct camera *cam);
+
+/* ------------------------------------------------------------------------
+ * Install event handlers which will keep up-to-date state of the currently
+ * hovered over tile.
+ * ------------------------------------------------------------------------
+ */
+int    M_Raycast_Install(struct map *map, struct camera *cam);
+
+/* ------------------------------------------------------------------------
+ * Uninstall handlers installed by 'M_Raycast_Install'
+ * ------------------------------------------------------------------------
+ */
+void   M_Raycast_Uninstall(void);
+
+/* ------------------------------------------------------------------------
+ * Determines how many tiles around the selected tile are highlighted during
+ * rendering. 0 (default) means no tile is highlighted; 1 = single tile is 
+ * highlighted; 3 = 3x3 grid is highlighted; etc.
+ * ------------------------------------------------------------------------
+ */
+void   M_Raycast_SetHighlightSize(size_t size);
+size_t M_Raycast_GetHighlightSize(void);
+
+/* ------------------------------------------------------------------------
+ * If returning true, the height of the map under the mouse cursor will be
+ * written to 'out'. Otherwise, the mouse cursor is not over the map surface.
+ * ------------------------------------------------------------------------
+ */
+bool   M_Raycast_MouseIntersecCoord(vec3_t *out);
+
+/* ------------------------------------------------------------------------
+ * If returning true, the height of the map under the ray originating at 
+ * the camera position and facing in the same direction as the camera is 
+ * written to 'out'.
+ * ------------------------------------------------------------------------
+ */
+bool   M_Raycast_CameraIntersecCoord(const struct camera *cam, vec3_t *out);
+
+/* ------------------------------------------------------------------------
+ * Utility function to convert an XZ worldspace coordinate to one in the 
+ * range (-1, -1) in the 'top left' corner to (1, 1) in the 'bottom right' 
+ * corner for square maps, with (0, 0) being in the exact center of the map. 
+ * Coordinates outside the map bounds will be ouside this range. Note that 
+ * for non-square maps, the proportion of the width to the height is kept 
+ * the same, meaning that the shorter dimension will not span the entire 
+ * range of [-1, 1]
+ * ------------------------------------------------------------------------
+ */
+vec2_t M_WorldCoordsToNormMapCoords(const struct map *map, vec2_t xz);
+
+/* ------------------------------------------------------------------------
+ * Returns true if the XZ coordinate is within the map bounds.
+ * ------------------------------------------------------------------------
+ */
+bool   M_PointInsideMap(const struct map *map, vec2_t xz);
+
+/* ------------------------------------------------------------------------
+ * Returns true if the XZ coordinate is over water.
+ * ------------------------------------------------------------------------
+ */
+bool   M_PointOverWater(const struct map *map, vec2_t pos);
+
+/* ------------------------------------------------------------------------
+ * Returns true if the XZ coordinate is over land.
+ * ------------------------------------------------------------------------
+ */
+bool   M_PointOverLand(const struct map *map, vec2_t pos);
+
+/* ------------------------------------------------------------------------
+ * Conservative chunk-granularity test for whether xz_pos is near any
+ * water tile. Returns true if the chunk containing xz_pos or any of its
+ * 8 neighbours has water. False positives possible (chunk size >> the
+ * actual proximity threshold); intended for cheap pruning where extra
+ * positives are acceptable.
+ * ------------------------------------------------------------------------
+ */
+bool   M_PointHasNearbyWater(const struct map *map, vec2_t xz_pos);
+
+/* ------------------------------------------------------------------------
+ * Precise per-tile test for whether xz_pos is within the configured radius
+ * (pf.video.water_prune_radius, in tiles) of a water tile. Backed by a
+ * precomputed membership mask, so this is an O(1) lookup suitable for
+ * pruning thousands of entities per frame.
+ * ------------------------------------------------------------------------
+ */
+bool   M_PointNearWater(const struct map *map, vec2_t xz_pos);
+
+/* ------------------------------------------------------------------------
+ * Returns true if the tile has at least one adjacent tile over water.
+ * ------------------------------------------------------------------------
+ */
+bool   M_TileAdjacentToWater(const struct map *map, const struct tile_desc *td);
+
+/* ------------------------------------------------------------------------
+ * Returns true if the tile has at least one adjacent tile over land.
+ * ------------------------------------------------------------------------
+ */
+bool   M_TileAdjacentToLand(const struct map *map, const struct tile_desc *td);
+
+/* ------------------------------------------------------------------------
+ * Returns true if any of the tiles under the object are adjacent to water
+ * or land.
+ * ------------------------------------------------------------------------
+ */
+bool   M_ObjectAdjacentToWater(const struct map *map, const struct obb *obb);
+bool   M_ObjectAdjacentToLand(const struct map *map, const struct obb *obb);
+
+/* ------------------------------------------------------------------------
+ * Returns an XZ coordinate that is contained within the map bounds. The 
+ * 'xz' arg is truncated if it's outside the map range, or unchanged otherwise.
+ * ------------------------------------------------------------------------
+ */
+vec2_t M_ClampedMapCoordinate(const struct map *map, vec2_t xz);
+
+/* ------------------------------------------------------------------------
+ * Returns the Y coordinate for an XZ point on the map's surface.
+ * ------------------------------------------------------------------------
+ */
+float  M_HeightAtPoint(const struct map *map, vec2_t xz);
+
+/* ------------------------------------------------------------------------
+ * Sets 'out to a tile descriptor for an XZ point on a the map. 'out' is valid
+ * if the function returns true.
+ * ------------------------------------------------------------------------
+ */
+bool   M_DescForPoint2D(const struct map *map, vec2_t point_xz, struct tile_desc *out);
+
+/* ------------------------------------------------------------------------
+ * Returns the material index for a particular texture, or '-1' if it is 
+ * not found.
+ * ------------------------------------------------------------------------
+ */
+int    M_MaterialIndexForTexture(const struct map *map, const char *texture);
+
+/* ------------------------------------------------------------------------
+ * Make an impassable region in the navigation data, making it not possible 
+ * for pathable units to pass through the region underneath the OBB.
+ * ------------------------------------------------------------------------
+ */
+void   M_NavCutoutStaticObject(const struct map *map, const struct obb *obb);
+
+/* ------------------------------------------------------------------------
+ * Update navigation private data after changes to the cost field.
+ * (ex. to remove a path in case it was blocked off by a placed object)
+ * ------------------------------------------------------------------------
+ */
+void   M_NavUpdatePortals(const struct map *map);
+
+/* ------------------------------------------------------------------------
+ * Update navigation private data (regarding which tile is reachanble from
+ * which other tiles) after changes to the cost field.
+ * ------------------------------------------------------------------------
+ */
+void   M_NavUpdateIslandsField(const struct map *map);
+
+/* ------------------------------------------------------------------------
+ * Makes a path request to the navigation subsystem, causing the required
+ * flowfields to be generated and cached. Returns true if a successful path
+ * has been made, false otherwise.
+ * ------------------------------------------------------------------------
+ */
+bool   M_NavRequestPath(const struct map *map, vec2_t xz_src, vec2_t xz_dest, 
+                        enum nav_layer layer, dest_id_t *out_dest_id);
+
+/* ------------------------------------------------------------------------
+ * Render the flow field that will steer entities towards a particular 
+ * destination over the map surface.
+ * Also render the LOS field of tiles directly visible from the destination.
+ * ------------------------------------------------------------------------
+ */
+void   M_NavRenderVisiblePathFlowField(const struct map *map, const struct camera *cam, 
+                                       dest_id_t id);
+/* ------------------------------------------------------------------------
+ * Render the vision information for a particular faction. Every tile is 
+ * color-coded based on the vision the specified faction has of it. 
+ * (black = unexplored, green = visible, yellow = in fog of war)
+ * ------------------------------------------------------------------------
+ */
+void   M_RenderChunkVisibility(const struct map *map, const struct camera *cam, 
+                               int faction_id);
+
+bool   M_NavDesiredGroupArrivalVelocity(const struct map *map, enum nav_layer layer, vec2_t curr_pos,
+                                        vec2_t centre_pos, uint16_t radius,
+                                        vec2_t *out_vel, bool *out_at_slot);
+
+/* ------------------------------------------------------------------------
+ * Target-based navigation queries: read-only test of whether the field a
+ * unit needs is cached, a read-only cached read of the desired velocity, and
+ * a (cache-mutating, nav-task-only) build of the needed field.
+ * ------------------------------------------------------------------------
+ */
+bool   M_NavRequiresPathRequest(const struct map *map, struct target target, vec2_t xz);
+vec2_t M_NavDesiredVelocityForTargetCached(const struct map *map, struct target target, vec2_t xz);
+bool   M_NavFlowFieldPathLength(const struct map *map, struct target target, vec2_t xz,
+                                int max_steps, float *out_len, vec2_t *out_end_xz, bool *out_capped);
+int    M_NavFlowFieldDirAt(const struct map *map, struct target target, vec2_t xz);
+int    M_NavBlockedTilesAround(const struct map *map, int layer, vec2_t xz, float reach,
+                               vec2_t *out_centres, int max, int *out_nterrain);
+void   M_NavTilePatch(const struct map *map, int layer, int row0, int col0, int dim,
+                      uint32_t *out_words);
+void   M_NavServicePathRequest(const struct map *map, struct target target, vec2_t xz);
+
+/* ------------------------------------------------------------------------
+ * Returns true if the specified coordinate is in direct line of sight of 
+ * the specified destination.
+ * ------------------------------------------------------------------------
+ */
+bool   M_NavHasDestLOS(const struct map *map, dest_id_t id, vec2_t curr_pos, vec2_t xz_dest);
+
+/* ------------------------------------------------------------------------
+ * Like M_NavHasDestLOS but read-only: peeks the cached LOS field rather than
+ * building it. Sets '*out_present' to whether the field was cached.
+ * ------------------------------------------------------------------------
+ */
+bool   M_NavHasDestLOSCached(const struct map *map, dest_id_t id, vec2_t curr_pos, bool *out_present);
+
+/* ------------------------------------------------------------------------
+ * True when the position's cached LOS answer is stale-served and its
+ * rate-capped rebuild has come due. Read-only, safe off the nav task.
+ * ------------------------------------------------------------------------
+ */
+bool   M_NavDestLOSRebuildDue(const struct map *map, dest_id_t id, vec2_t curr_pos);
+
+/* ------------------------------------------------------------------------
+ * Like M_NavHasDestLOS on the navigation task: a miss records a deferred
+ * chain of LOS builds instead of flooding inline. See N_EnsureDestLOS.
+ * ------------------------------------------------------------------------
+ */
+enum los_ensure_result M_NavEnsureDestLOS(const struct map *map, dest_id_t id, vec2_t curr_pos,
+                                          vec2_t xz_dest, bool *out_vis);
+
+/* ------------------------------------------------------------------------
+ * Returns true if a deferred LOS build covering the position's chunk is
+ * already recorded this tick for the destination.
+ * ------------------------------------------------------------------------
+ */
+bool   M_NavDestLOSPending(const struct map *map, dest_id_t id, vec2_t curr_pos);
+
+/* ------------------------------------------------------------------------
+ * Returns true if the particular entity is in direct line of sight of the 
+ * specified position.
+ * ------------------------------------------------------------------------
+ */
+bool   M_NavHasEntityLOS(const struct map *map, enum nav_layer layer, 
+                         vec2_t xz_pos, const uint32_t uid);
+
+/* ------------------------------------------------------------------------
+ * Returns true if the specified positions is pathable (i.e. a unit is 
+ * allowed to stand on this region of the map)
+ * ------------------------------------------------------------------------
+ */
+bool   M_NavPositionPathable(const struct map *map, enum nav_layer layer, 
+                             vec2_t xz_pos);
+
+/* ------------------------------------------------------------------------
+ * Returns true if the specified positions is blocked (i.e. a unit or entity
+ * is currently occupying this tile, causing it to temporarily become non-traversable)
+ * ------------------------------------------------------------------------
+ */
+bool   M_NavPositionBlocked(const struct map *map, enum nav_layer layer, 
+                            vec2_t xz_pos);
+
+/* ------------------------------------------------------------------------
+ * The count of times a tile of the cell (a few tiles on a side) holding the
+ * XZ position has been freed of its last blocker on the layer.
+ * ------------------------------------------------------------------------
+ */
+uint32_t M_NavCellFreedGeneration(const struct map *map, enum nav_layer layer,
+                                  vec2_t xz_pos);
+
+/* ------------------------------------------------------------------------
+ * Returns the closest position to the destination that is pathable to from
+ * the (valid) source position. In the best case, this is the destination
+ * itself.
+ * ------------------------------------------------------------------------
+ */
+vec2_t M_NavClosestReachableDest(const struct map *map, enum nav_layer layer, 
+                                 vec2_t xz_src, vec2_t xz_dst);
+
+/* ------------------------------------------------------------------------
+ * If true is returned, 'out' is set to the worldspace XZ position of the 
+ * closest reachable point on the map that is adjacent to the specified entity.
+ * For 'static' entities, the tiles under the OBB are used, else the tiles
+ * under the selection circle are used.
+ * ------------------------------------------------------------------------
+ */
+bool   M_NavClosestReachableAdjacentPos(const struct map *map, enum nav_layer layer,
+                                        vec2_t xz_src, const uint32_t target_uid,
+                                        vec2_t *out);
+
+/* Like M_NavClosestReachableAdjacentPos, but resolving the target from a
+ * snapshot query context instead of live state (safe off the main thread).
+ */
+bool   M_NavClosestReachableAdjacentPosFrom(const struct map *map, enum nav_layer layer,
+                                            vec2_t xz_src, uint32_t target_uid,
+                                            const struct nav_unit_query_ctx *ctx, vec2_t *out);
+
+/* ------------------------------------------------------------------------
+ * Will return the XZ map position that the entity at the source location
+ * should travel to in order to get in range of the target position using
+ * the shortest path.
+ * ------------------------------------------------------------------------
+ */
+vec2_t M_NavClosestReachableInRange(const struct map *map, enum nav_layer layer,
+                                    vec2_t xz_src, vec2_t xz_target, float range);
+
+/* ------------------------------------------------------------------------
+ * Will write the XZ map position of the closest currently pathable location
+ * to the source to out, if it exists.
+ * ------------------------------------------------------------------------
+ */
+bool M_NavClosestPathable(const struct map *map, enum nav_layer layer, 
+                          vec2_t xz_src, vec2_t *out);
+
+/* ------------------------------------------------------------------------
+ * Writes up to 'maxout' worldspace XZ tile centres to 'out' - the nearest
+ * pathable tiles around 'xz_center', sorted by distance. Returns the count.
+ * ------------------------------------------------------------------------
+ */
+int M_NavClosestConnectedPathableTiles(const struct map *map, enum nav_layer layer,
+                               vec2_t xz_center, vec2_t *out, int maxout, float max_radius);
+
+/* ------------------------------------------------------------------------
+ * Convert world positions to a sorted set of tile keys for membership queries
+ * by M_NavSegmentWithinRegion. Returns the number of keys written.
+ * ------------------------------------------------------------------------
+ */
+size_t M_NavTileKeysForPositions(const struct map *map, const vec2_t *positions,
+                                 size_t n, uint64_t *out);
+
+/* ------------------------------------------------------------------------
+ * Returns true if every tile the segment from 'a' to 'b' crosses is in the
+ * sorted tile key set 'keys'.
+ * ------------------------------------------------------------------------
+ */
+bool   M_NavSegmentWithinRegion(const struct map *map, vec2_t a, vec2_t b,
+                                const uint64_t *keys, size_t num);
+
+/* ------------------------------------------------------------------------
+ * Geodesic distance in tiles, for each query position, from the region tile
+ * nearest 'entry', flooded through the sorted key set 'keys'. Ranks region
+ * slots farthest-from-entry-first. Returns the largest distance written.
+ * ------------------------------------------------------------------------
+ */
+int    M_NavRegionGeodesicDist(const struct map *map, const uint64_t *keys, size_t num_keys,
+                               vec2_t entry, const vec2_t *queries, size_t num_queries,
+                               int *out_dist);
+
+/* ------------------------------------------------------------------------
+ * Returns the closest position to 'pos' that is adjacent to a land tile.
+ * ------------------------------------------------------------------------
+ */
+vec2_t M_NavClosestPointAdjacentToLand(const struct map *map, vec2_t pos);
+
+/* ------------------------------------------------------------------------
+ * Returns the closest position to 'pos' that is adjacent to a land tile
+ * having the same global "island ID" as the tile under the 'island_pos'
+ * location.
+ * ------------------------------------------------------------------------
+ */
+vec2_t M_NavClosestPointAdjacentToIsland(const struct map *map, vec2_t pos,
+                                         vec2_t island_pos, enum nav_layer layer);
+
+/* ------------------------------------------------------------------------
+ * Returns true if the two locations can currently be reached from one another.
+ * ------------------------------------------------------------------------
+ */
+bool M_NavLocationsReachable(const struct map *map, enum nav_layer layer, 
+                             vec2_t a, vec2_t b);
+
+/* ------------------------------------------------------------------------
+ * Change the blocker reference count for the navigation tile under the
+ * specified position. Flow fields will steer around tiles with a blocker 
+ * count of greater than 0.
+ * ------------------------------------------------------------------------
+ */
+void   M_NavBlockersIncref(vec2_t xz_pos, float range, int faction_id, 
+                           uint32_t flags, const struct map *map);
+void   M_NavBlockersDecref(vec2_t xz_pos, float range, int faction_id, 
+                           uint32_t flags, const struct map *map);
+
+/* ------------------------------------------------------------------------
+ * Reserve or release the ground a parked body of the given radius would
+ * stamp on the layers of the given layer's class. Placement treats reserved
+ * tiles as taken; flow fields ignore them.
+ * ------------------------------------------------------------------------
+ */
+void   M_NavReserveIncref(vec2_t xz_pos, float range, enum nav_layer layer,
+                          const struct map *map);
+void   M_NavReserveDecref(vec2_t xz_pos, float range, enum nav_layer layer,
+                          const struct map *map);
+
+void   M_NavBlockersIncrefOBB(const struct map *map, int faction_id, 
+                              uint32_t flags, const struct obb *obb);
+void   M_NavBlockersDecrefOBB(const struct map *map, int faction_id, 
+                              uint32_t flags, const struct obb *obb);
+
+/* ------------------------------------------------------------------------
+ * Wrapper around navigation APIs.
+ * ------------------------------------------------------------------------
+ */
+uint32_t M_NavDestIDForPos(const struct map *map, vec2_t xz_pos, enum nav_layer layer);
+uint32_t M_NavDestIDForPosAttacking(const struct map *map, vec2_t xz_pos, 
+                                    enum nav_layer layer, int faction_id);
+void     M_NavGetResolution(const struct map *map, struct map_resolution *out);
+bool     M_NavObjectBuildable(const struct map *map, enum nav_layer layer, 
+                              bool allow_shore, const struct obb *obb);
+bool     M_NavIsMaximallyClose(const struct map *map, enum nav_layer layer, 
+                               vec2_t xz_pos, vec2_t xz_dest, float tolerance);
+bool     M_NavIsAdjacentToImpassable(const struct map *map, enum nav_layer layer, vec2_t xz_pos);
+void     M_NavCopyIslandsFieldView(const struct map *map, vec2_t center,
+                                   int nrows, int ncols, enum nav_layer layer, uint16_t *out_field);
+void     M_NavCopyBlockedFieldView(const struct map *map, vec2_t center,
+                                   int nrows, int ncols, enum nav_layer layer, bool with_reserved,
+                                   uint16_t enemies, uint8_t *out_field);
+void     M_NavCellArrivalFieldCreate(const struct map *map, size_t rdim, size_t cdim,
+                                     enum nav_layer layer, uint16_t enemies,
+                                     struct tile_desc target, struct tile_desc center,
+                                     uint8_t *out, void *workspace, size_t workspace_size,
+                                     const struct nav_cell_overlay *overlay);
+void     M_NavCellArrivalFieldUpdateToNearestPathable(const struct map *map,
+                                  size_t rdim, size_t cdim, enum nav_layer layer, uint16_t enemies,
+                                  struct tile_desc start, struct tile_desc center,
+                                  uint8_t *inout, void *workspace, size_t workspace_size,
+                                  const struct nav_cell_overlay *overlay);
+void     M_NavGroupArrivalFieldCreate(const struct map *map, size_t rdim, size_t cdim,
+                                      enum nav_layer layer, uint16_t enemies,
+                                      const vec2_t *targets, size_t ntargets, vec2_t center,
+                                      uint8_t *out, void *workspace, size_t workspace_size,
+                                      const struct nav_cell_overlay *overlay);
+bool     M_NavIsAdjacentToIsland(const struct map *map, enum nav_layer layer, vec2_t xz_pos, 
+                                 float radius, vec2_t island_pos);
+bool     M_NavIsAdjacentToIslandOBB(const struct map *map, enum nav_layer layer, 
+                                    const struct obb *obb, vec2_t island_pos);
+
+size_t   M_NavCostBaseBufferSize(const struct map *map);
+size_t   M_NavBlockersBufferSize(const struct map *map);
+
+size_t   M_NavCopyCostBasePacked(const struct map *map, void *out, size_t maxout);
+size_t   M_NavCopyBlockersPacked(const struct map *map, void *out, size_t maxout);
+
+/* ------------------------------------------------------------------------
+ * Request an asynchronous computation of a field.
+ * ------------------------------------------------------------------------
+ */
+
+void M_NavRequestAsyncEnemySeekField(const struct map *map, enum nav_layer layer, 
+                                     vec2_t curr_pos, int faction_id, float range);
+
+/* ------------------------------------------------------------------------
+ * True if the enemy field for the specified reach is cached and has a flow
+ * direction at the specified position.
+ * ------------------------------------------------------------------------
+ */
+enum range_field_state M_NavEnemyRangeFieldState(const struct map *map, enum nav_layer layer,
+                                int faction_id, float range, vec2_t xz_pos);
+enum range_field_state M_NavEntityRangeFieldState(const struct map *map, enum nav_layer layer,
+                                 uint32_t ent, float range, vec2_t xz_pos);
+void M_NavRequestAsyncSurroundField(const struct map *map, enum nav_layer layer, 
+                                    vec2_t curr_pos, uint32_t ent, int faction_id, float range);
+void M_NavRequestAsyncGroupArrivalField(const struct map *map, enum nav_layer layer,
+                                        vec2_t centre_pos, uint16_t radius);
+void M_NavInvalidateZoneFieldsAt(const struct map *map, vec2_t xz_pos, enum nav_layer layer);
+
+/* ------------------------------------------------------------------------
+ * Returns true if the tiles under the entity selection cirlce overlap or 
+ * share an edge with any of the tiles under the target entity.
+ * For 'static' enties, the OBB is used. Else, the selection circle is used.
+ * ------------------------------------------------------------------------
+ */
+bool     M_NavObjAdjacent(const struct map *map, const uint32_t uid, 
+                         const uint32_t target_uid);
+
+/* ------------------------------------------------------------------------
+ * Like M_NavObjAdjacent, but allowing passsing all the required state
+ * as arguments.
+ * ------------------------------------------------------------------------
+ */
+bool     M_NavObjAdjacentToStaticWith(const struct map *map, vec2_t xz_pos, float radius, 
+                                      const struct obb *stat);
+bool     M_NavObjAdjacentToDynamicWith(const struct map *map, vec2_t xz_pos_a, float radius_a,
+                                       vec2_t xz_pos_b, float radius_b);
+
+/* ------------------------------------------------------------------------
+ * Like M_NavObjAdjacent, but resolving both entities from a snapshot query
+ * context instead of live state, so it is safe to call off the main thread.
+ * ------------------------------------------------------------------------
+ */
+bool     M_NavObjAdjacentFrom(const struct map *map, uint32_t uid, uint32_t target_uid,
+                              const struct nav_unit_query_ctx *ctx);
+
+/* ------------------------------------------------------------------------
+ * Sets 'out' to pointer to 'struct tile' for the specified descriptor. 
+ * Returns 'true' on success, 'false' on failure.
+ * ------------------------------------------------------------------------
+ */
+bool   M_TileForDesc(const struct map *map, struct tile_desc desc, struct tile **out);
+
+/* ------------------------------------------------------------------------
+ * Get the resolution (chunks, tiles) of the specified map.
+ * ------------------------------------------------------------------------
+ */
+void   M_GetResolution(const struct map *map, struct map_resolution *out);
+
+/* ------------------------------------------------------------------------
+ * Returns the center point of the map, in world space.
+ * ------------------------------------------------------------------------
+ */
+vec3_t M_GetCenterPos(const struct map *map);
+
+/* ------------------------------------------------------------------------
+ * Returns the position of the top-left corner of the amp, in world space.
+ * ------------------------------------------------------------------------
+ */
+vec3_t M_GetPos(const struct map *map);
+
+
+/*###########################################################################*/
+/* MINIMAP                                                                   */
+/*###########################################################################*/
+
+/* ------------------------------------------------------------------------
+ * Creates a minimap texture from the map to be rendered later.
+ * ------------------------------------------------------------------------
+ */
+bool   M_InitMinimap     (struct map *map, vec2_t center_pos);
+
+/* ------------------------------------------------------------------------
+ * Update a chunk-sized region of the minimap texture with the most 
+ * up-to-date vertex data.
+ * ------------------------------------------------------------------------
+ */
+bool   M_UpdateMinimapChunk(const struct map *map, int chunk_r, int chunk_c);
+
+/* ------------------------------------------------------------------------
+ * Frees the resources allocated by 'M_InitMinimap'.
+ * ------------------------------------------------------------------------
+ */
+void   M_FreeMinimap     (struct map *map);
+
+/*###########################################################################*/
+/* MAP TERRAIN BAKE                                                          */
+/*###########################################################################*/
+
+/* The top-down view a chunk's lit top faces are baked from, and the affine
+ * taking world XZ to the bake's texture coordinates.
+ */
+struct terrain_bake_frame{
+    mat4x4_t view;
+    mat4x4_t proj;
+    vec4_t   xform;
+};
+
+/* One quadrant of a chunk bake: the chunk and its in-bounds neighbours drawn
+ * top-down, with the map pass state the terrain shader needs.
+ */
+struct terrain_bake_slice{
+    struct terrain_bake_frame frame;
+    int                       slice;
+    vec3_t                    view_dir;
+    vec2_t                    map_pos;
+    size_t                    num_splats;
+    struct splatmap           splatmap;
+    size_t                    num_chunks;
+    void                     *chunk_rprivates[9];
+    mat4x4_t                  chunk_models[9];
+};
+
+/* ------------------------------------------------------------------------
+ * Set up the residency state for the map's chunks. The pool of baked layers
+ * is configured from the 'pf.video.terrain_bake_*' settings.
+ * ------------------------------------------------------------------------
+ */
+bool   M_TerrainBake_Init(const struct map *map);
+void   M_TerrainBake_Shutdown(void);
+
+/* ------------------------------------------------------------------------
+ * Re-create the pool of baked layers; every chunk is baked again.
+ * ------------------------------------------------------------------------
+ */
+void   M_TerrainBake_Reconfigure(int res, bool compress);
+
+void   M_TerrainBake_ChunkFrame(const struct map *map, int r, int c,
+                                struct terrain_bake_frame *out);
+
+/* ------------------------------------------------------------------------
+ * A stale chunk is drawn from its mesh until it has been baked again.
+ * ------------------------------------------------------------------------
+ */
+void   M_TerrainBake_MarkChunkStale(int r, int c);
+void   M_TerrainBake_MarkAllStale(void);
+void   M_TerrainBake_OnLightChanged(vec3_t light_pos, vec3_t ambient, vec3_t emit);
+
+/* ------------------------------------------------------------------------
+ * Once per frame, before the render passes are queued: advance the in-flight
+ * bake and return the per-chunk layer indices (-1 for chunks drawn from the
+ * mesh), allocated in the frame's render workspace. NULL when disabled.
+ * ------------------------------------------------------------------------
+ */
+const int *M_TerrainBake_Tick(const struct camera *cam);
+
+/* ------------------------------------------------------------------------
+ * Sets the virtual resolution. This determines how the other minimap 
+ * coordinates get mapped to the viewport.
+ * ------------------------------------------------------------------------
+ */
+void   M_SetMinimapVres(struct map *map, vec2_t vres);
+/* ------------------------------------------------------------------------
+ * This returns the bounds for the current aspect ratio based on the 
+ * resize mask.
+ * ------------------------------------------------------------------------
+ */
+void   M_GetMinimapAdjVres(const struct map *map, vec2_t *out_vres);
+
+/* ------------------------------------------------------------------------
+ * The minimap position, in virtual screen coordinates.
+ * ------------------------------------------------------------------------
+ */
+void   M_GetMinimapPos   (const struct map *map, vec2_t *out_center_pos);
+void   M_SetMinimapPos   (struct map *map, vec2_t center_pos);
+
+/* ------------------------------------------------------------------------
+ * The minimap size, in virtual screen coordinates.
+ * ------------------------------------------------------------------------
+ */
+int    M_GetMinimapSize(const struct map *map);
+void   M_SetMinimapSize(struct map *map, int side_len);
+
+/* ------------------------------------------------------------------------
+ * Controls the minimap bounds as the screen resizes. See ui.h
+ * ------------------------------------------------------------------------
+ */
+void   M_SetMinimapResizeMask(struct map *map, int resize_mask);
+
+/* ------------------------------------------------------------------------
+ * Render the minimap at the location specified by 'M_SetMinimapPos' and 
+ * draw a box around the area visible by the specified camera.
+ * ------------------------------------------------------------------------
+ */
+void   M_RenderMinimap   (const struct map *map, const struct camera *cam);
+
+/* ------------------------------------------------------------------------
+ * Render a coloroed box for every specified unit in the minimap region.
+ * ------------------------------------------------------------------------
+ */
+void   M_RenderMinimapUnits(const struct map *map, size_t nunits, 
+                            vec2_t *posbuff, vec3_t *colorbuff);
+
+/* ------------------------------------------------------------------------
+ * Render the minimap at the location specified by 'M_SetMinimapPos'.
+ * ------------------------------------------------------------------------
+ */
+bool   M_MouseOverMinimap(const struct map *map);
+
+/* ------------------------------------------------------------------------
+ * Returns false if none of the chunks visible by the camera have water tiles.
+ * This can allow us to skip rendering the water altogether in some cases.
+ * ------------------------------------------------------------------------
+ */
+bool   M_WaterMaybeVisible(const struct map *map, const struct camera *cam);
+
+/* ------------------------------------------------------------------------
+ * Add/remove secondary (splat) materials that are blended together with
+ * some existing material.
+ * ------------------------------------------------------------------------
+ */
+bool   M_AddSplat(struct map *map, int base_mat_idx, int accent_mat_idx);
+bool   M_RemoveSplat(struct map *map, int base_mat_idx, int accent_mat_idx);
+
+/* ------------------------------------------------------------------------
+ * Returns true if the mouse is over a valid map location on the minimap.
+ * In this case, 'out' is set to the worldspace coordinate of the position
+ * over the map surface.
+ * ------------------------------------------------------------------------
+ */
+bool   M_MinimapMouseMapCoords(const struct map *map, vec3_t *out);
+
+/* ------------------------------------------------------------------------
+ * Access the (RGBA) color of the minimap border.
+ * ------------------------------------------------------------------------
+ */
+vec4_t M_MinimapGetBorderClr(void);
+void   M_MinimapSetBorderClr(vec4_t clr);
+void   M_MinimapClearBorderClr(void);
+
+
+/*###########################################################################*/
+/* MAP ASSET LOADING                                                         */
+/*###########################################################################*/
+
+/* ------------------------------------------------------------------------
+ * Initialize private map data ('outmap', which is allocated by the calleer) 
+ * from PFMAP stream.
+ * ------------------------------------------------------------------------
+ */
+bool   M_AL_InitMapFromStream(const struct pfmap_hdr *header, const char *basedir,
+                              SDL_RWops *stream, void *outmap, bool update_navgrid);
+
+/* ------------------------------------------------------------------------
+ * Returns the size, in bytes, needed to store the private map data
+ * based on the header contents.
+ * ------------------------------------------------------------------------
+ */
+size_t M_AL_BuffSizeFromHeader(const struct pfmap_hdr *header);
+
+/* ------------------------------------------------------------------------
+ * Writes the map in PFMap format.
+ * ------------------------------------------------------------------------
+ */
+void   M_AL_DumpMap(FILE *stream, const struct map *map);
+
+/* ------------------------------------------------------------------------
+ * Cleans up resource allocations done during map initialization.
+ * ------------------------------------------------------------------------
+ */
+void   M_AL_FreePrivate(struct map *map);
+
+/* ------------------------------------------------------------------------
+ * Updates the material list for the map, parsed from a PFMAP materials 
+ * section string.
+ * ------------------------------------------------------------------------
+ */
+bool   M_AL_UpdateChunkMats(const struct map *map, int chunk_r, int chunk_c, 
+                            const char *mats_string);
+
+/* ------------------------------------------------------------------------
+ * Update a single tile's attributes. The affected tile and its neighbours are
+ * added to a dirty set; the renderer-side vertex data is refreshed in a batch
+ * once per frame. Requires 'M_AL_InitTileUpdateBuffer' to have been called.
+ * ------------------------------------------------------------------------
+ */
+bool   M_AL_UpdateTile(struct map *map, const struct tile_desc *desc,
+                       const struct tile *tile);
+
+/* ------------------------------------------------------------------------
+ * Set up / tear down the per-frame buffering of tile updates for the map.
+ * 'M_AL_InitTileUpdateBuffer' registers a render-event handler that flushes
+ * the accumulated tile updates as batched draw commands once per frame.
+ * ------------------------------------------------------------------------
+ */
+bool   M_AL_InitTileUpdateBuffer(const struct map *map);
+void   M_AL_DestroyTileUpdateBuffer(void);
+
+/* ------------------------------------------------------------------------
+ * The size (in bytes) needed to store a shallow copy of the map.
+ * ------------------------------------------------------------------------
+ */
+size_t M_AL_ShallowCopySize(size_t nrows, size_t ncols);
+
+/* ------------------------------------------------------------------------
+ * Copy map data to 'dst' buffer, which must have at least 'M_AL_ShallowCopySize'
+ * bytes free. Handles to contexts/resources of other subsystems (ex. navigation 
+ * and rendering data) are copied weakly.
+ * ------------------------------------------------------------------------
+ */
+void   M_AL_ShallowCopy(struct map *dst, const struct map *src);
+void   M_AL_ShallowCopyDirty(struct map *dst, const struct map *src);
+
+/* ------------------------------------------------------------------------
+ * Makes a copy of the map, also copying cost field, blocked fields and
+ * faction refcounts from the navigation data.
+ * ------------------------------------------------------------------------
+ */
+struct map *M_AL_CopyWithFields(const struct map *src, const enum nav_layer *layers,
+                                size_t nlayers, struct nav_window window);
+void        M_AL_FreeCopyWithFields(struct map *map);
+
+/* A read-only snapshot whose navigation chunks alias the live map's canonical
+ * (copy-on-write reader) view, rather than a deep copy. Call M_NavPublish on the
+ * live map first so the canonical reflects the latest writer-side changes. */
+struct map *M_AL_SnapshotShared(const struct map *src);
+void        M_AL_FreeSnapshotShared(struct map *map);
+
+/* ------------------------------------------------------------------------
+ * Write the map contents to the stream in PFMap format.
+ * ------------------------------------------------------------------------
+ */
+bool   M_AL_WritePFMap(const struct map *map, SDL_RWops *stream);
+
+/* ------------------------------------------------------------------------
+ * Access navigation stats.
+ * ------------------------------------------------------------------------
+ */
+void M_GetFieldCacheStats(const struct map *map, struct fc_stats *out);
+void M_NavGetTickDiag(const struct map *map, struct nav_tick_diag *out);
+
+/* ------------------------------------------------------------------------
+ * Post a batch of flow-field cache hit-rate samples from the nav tick task.
+ * ------------------------------------------------------------------------
+ */
+void M_NavAddFlowSamples(const struct map *map, unsigned query, unsigned hit);
+
+/* ------------------------------------------------------------------------
+ * Post a batch of LOS-field cache hit-rate samples from the nav tick task.
+ * ------------------------------------------------------------------------
+ */
+void M_NavAddLosSamples(const struct map *map, unsigned query, unsigned hit);
+
+/*###########################################################################*/
+/* MAP COVER                                                                 */
+/*###########################################################################*/
+
+bool M_FoliageInit(const struct map *map);
+void M_FoliageShutdown(void);
+void M_FoliageUpdateTile(struct tile_desc td);
+
+#endif

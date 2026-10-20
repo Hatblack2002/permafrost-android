@@ -1,0 +1,810 @@
+/*
+ *  This file is part of Permafrost Engine. 
+ *  Copyright (C) 2017-2026 Eduard Permyakov 
+ *
+ *  Permafrost Engine is free software: you can redistribute it and/or modify
+ *  it under the terms of the GNU General Public License as published by
+ *  the Free Software Foundation, either version 3 of the License, or
+ *  (at your option) any later version.
+ *
+ *  Permafrost Engine is distributed in the hope that it will be useful,
+ *  but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *  GNU General Public License for more details.
+ *
+ *  You should have received a copy of the GNU General Public License
+ *  along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ * 
+ *  Linking this software statically or dynamically with other modules is making 
+ *  a combined work based on this software. Thus, the terms and conditions of 
+ *  the GNU General Public License cover the whole combination. 
+ *  
+ *  As a special exception, the copyright holders of Permafrost Engine give 
+ *  you permission to link Permafrost Engine with independent modules to produce 
+ *  an executable, regardless of the license terms of these independent 
+ *  modules, and to copy and distribute the resulting executable under 
+ *  terms of your choice, provided that you also meet, for each linked 
+ *  independent module, the terms and conditions of the license of that 
+ *  module. An independent module is a module which is not derived from 
+ *  or based on Permafrost Engine. If you modify Permafrost Engine, you may 
+ *  extend this exception to your version of Permafrost Engine, but you are not 
+ *  obliged to do so. If you do not wish to do so, delete this exception 
+ *  statement from your version.
+ *
+ */
+
+#ifndef RENDER_H
+#define RENDER_H
+
+#include "../../pf_math.h"
+#include "../../sprite.h"
+
+#include <stddef.h>
+#include <stdio.h>
+#include <stdbool.h>
+
+#include <SDL.h> /* for SDL_RWops */
+
+struct pfobj_hdr;
+struct entity;
+struct skeleton;
+struct tile;
+struct tile_desc;
+struct map;
+struct camera;
+struct frustum;
+struct render_input;
+struct nk_draw_list;
+struct map_resolution;
+struct terrain_bake_slice;
+struct obb;
+struct aabb;
+struct ent_stat_rstate;
+struct ent_anim_rstate;
+struct anim_pose_data_desc;
+struct splatmap;
+struct gpu_mem_accounting;
+
+enum render_pass{
+    RENDER_PASS_DEPTH,
+    RENDER_PASS_REGULAR
+};
+
+struct ui_vert{
+    vec2_t  screen_pos;
+    vec2_t  uv;
+    uint8_t color[4];
+};
+
+struct sprite_desc{
+    struct sprite_sheet_desc sheet;
+    size_t                   frame;
+    vec2_t                   ws_size;
+    vec3_t                   ws_pos;
+};
+
+#define VERTS_PER_SIDE_FACE  (6)
+#define VERTS_PER_TOP_FACE   (24)
+#define VERTS_PER_TILE       (4 * VERTS_PER_SIDE_FACE + VERTS_PER_TOP_FACE)
+#define TILE_DEPTH           (3)
+#define MAX_MATERIALS        (16)
+
+/*###########################################################################*/
+/* RENDER OPENGL                                                             */
+/*###########################################################################*/
+
+/* ---------------------------------------------------------------------------
+ * Performs the OpenGL draw calls in order to render the object based on the 
+ * contents of its' private data.
+ * ---------------------------------------------------------------------------
+ */
+void   R_GL_Draw(const void *render_private, mat4x4_t *model, const bool *translucent);
+
+/* ---------------------------------------------------------------------------
+ * Draw a terrain chunk's top faces from its baked texture layer. 'xform' maps
+ * world XZ to the layer's texture coordinates.
+ * ---------------------------------------------------------------------------
+ */
+void   R_GL_DrawChunkBaked(const void *render_private, mat4x4_t *model,
+                           const int *layer, const vec4_t *xform);
+
+/* ---------------------------------------------------------------------------
+ * Draw only the side (wall) faces of a terrain chunk with its own shader.
+ * ---------------------------------------------------------------------------
+ */
+void   R_GL_DrawChunkWalls(const void *render_private, mat4x4_t *model);
+
+/* ---------------------------------------------------------------------------
+ * Clear the draw buffer and set up the global OpenGL state at the beginning 
+ * of the frame.
+ * ---------------------------------------------------------------------------
+ */
+void   R_GL_BeginFrame(void);
+
+/* ---------------------------------------------------------------------------
+ * Mark the end of a rendered frame, invalidate render buffer.
+ * ---------------------------------------------------------------------------
+ */
+void   R_GL_EndFrame(void);
+
+/* ---------------------------------------------------------------------------
+ * Sets the view matrix for all relevant shader programs. 
+ * ---------------------------------------------------------------------------
+ */
+void   R_GL_SetViewMatAndPos(const mat4x4_t *view, const vec3_t *pos);
+
+/* ---------------------------------------------------------------------------
+ * Sets the projection matrix for all relevant shader programs.
+ * ---------------------------------------------------------------------------
+ */
+void   R_GL_SetProj(const mat4x4_t *proj);
+
+/* ---------------------------------------------------------------------------
+ * Set the global ambient color that will impact all models based on their 
+ * materials. The color is an RGB floating-point multiplier. 
+ * ---------------------------------------------------------------------------
+ */
+void   R_GL_SetAmbientLightColor(const vec3_t *color);
+
+/* ---------------------------------------------------------------------------
+ * Set the color of the global light source.
+ * The color is an RGB floating-point multiplier. 
+ * ---------------------------------------------------------------------------
+ */
+void   R_GL_SetLightEmitColor(const vec3_t *color);
+
+/* ---------------------------------------------------------------------------
+ * Set the light position that will impact all models. 
+ * Only one light source is supported for the time being. 
+ * This position must be in world space.
+ * ---------------------------------------------------------------------------
+ */
+void   R_GL_SetLightPos(const vec3_t *pos);
+
+/* ---------------------------------------------------------------------------
+ * Render an entitiy's skeleton which is used for animation. 
+ * The camera argument is for deriving the screenspace position of text labels
+ * for the joint names. If 'cam' is NULL, the labels won't be rendered.
+ *
+ * ---------------------------------------------------------------------------
+ */
+void   R_GL_DrawSkeleton(mat4x4_t *model, const struct skeleton *skel, 
+                         const struct camera *cam);
+
+/* ---------------------------------------------------------------------------
+ * Render the model to a texture and save the output texture to the specified
+ * key.
+ * ---------------------------------------------------------------------------
+ */
+void   R_GL_DrawModelToTexture(const void *render_private, const struct obb *obb, 
+                               struct ent_anim_rstate *anim_state, const char *key);
+
+/* ---------------------------------------------------------------------------
+ * Push/pop a per-model loading-screen status line ("Loading model: <name>")
+ * while a cold model is baked. Render-thread commands; the push re-presents the
+ * loading screen so the status is shown before the model's slices are baked.
+ * ---------------------------------------------------------------------------
+ */
+void   R_GL_LoadingScreenPushModel(const char *name);
+void   R_GL_LoadingScreenPopModel(void);
+
+/* ---------------------------------------------------------------------------
+ * Debugging utility to draw X(red), Y(green), Z(blue) axes at the origin
+ * ---------------------------------------------------------------------------
+ */
+void   R_GL_DrawOrigin(const void *render_private, mat4x4_t *model);
+
+/* ---------------------------------------------------------------------------
+ * Debugging utility to draw normals as yellow rays going out from the model.
+ * ---------------------------------------------------------------------------
+ */
+void   R_GL_DrawNormals(const void *render_private, mat4x4_t *model, const bool *anim);
+
+/* ---------------------------------------------------------------------------
+ * Debugging utility to draw an infinite ray defined by an origin and a direction.
+ * ---------------------------------------------------------------------------
+ */
+void   R_GL_DrawRay(const vec3_t *origin, const vec3_t *dir, mat4x4_t *model, 
+                    const vec3_t *color, const float *t);
+
+/* ---------------------------------------------------------------------------
+ * Render the oriented bounding box for collidable entities.
+ * ---------------------------------------------------------------------------
+ */
+void   R_GL_DrawOBB(const struct aabb *aabb, const mat4x4_t *model);
+
+/* ---------------------------------------------------------------------------
+ * Render a 2D box on the screen. 'screen_pos' + 'signed_size' is the 'opposite'
+ * corner of the box. Both are given in screen coordinates.
+ * ---------------------------------------------------------------------------
+ */
+void   R_GL_DrawBox2D(const vec2_t *screen_pos, const vec2_t *signed_size, 
+                      const vec3_t *color, const float *width);
+
+/* ---------------------------------------------------------------------------
+ * Writes the framebuffer color region (0, 0, width, height) to a PPM file.
+ * ---------------------------------------------------------------------------
+ */
+void   R_GL_DumpFBColor_PPM(const char *filename, const int *width, const int *height);
+
+
+/* ---------------------------------------------------------------------------
+ * Writes the framebuffer depth region (0, 0, width, height) to a PPM file. 
+ * 'linearize' should be set to true when perspective projection is used. In 
+ * this case, 'near' and 'far' should be the near and far planes used for 
+ * perspective projection. If 'linearize' is false, they are ignored.
+ * ---------------------------------------------------------------------------
+ */
+void   R_GL_DumpFBDepth_PPM(const char *filename, const int *width, const int *height, 
+                            const bool *linearize, const GLfloat *nearp, const GLfloat *farp);
+
+/* ---------------------------------------------------------------------------
+ * Render a selection circle over the map surface.
+ * ---------------------------------------------------------------------------
+ */
+void   R_GL_DrawSelectionCircle(const vec2_t *xz, const float *radius, const float *width, 
+                                const vec3_t *color, const struct map *map);
+
+/* ---------------------------------------------------------------------------
+ * Render a selection rectangle over the map surface.
+ * ---------------------------------------------------------------------------
+ */
+void   R_GL_DrawSelectionRectangle(const struct obb *box, const float *width, 
+                                   const vec3_t *color, const struct map *map);
+
+/* ---------------------------------------------------------------------------
+ * Render a line over the map surface.
+ * ---------------------------------------------------------------------------
+ */
+void   R_GL_DrawLine(vec2_t endpoints[], const float *width, const vec3_t *color, 
+                     const struct map *map);
+
+/* ---------------------------------------------------------------------------
+ * Render a quadrilateral over the map surface.
+ * ---------------------------------------------------------------------------
+ */
+void   R_GL_DrawQuad(vec2_t corners[], const float *width, const vec3_t *color, 
+                     const struct map *map);
+
+/* ---------------------------------------------------------------------------
+ * Render an array of translucent quads over the map surface. The quad corners are 
+ * specified in chunk coordinates, with 4 corners per quad in the 'xz_corners'
+ * buffer. 
+ * ---------------------------------------------------------------------------
+ */
+void   R_GL_DrawMapOverlayQuads(vec2_t *xz_corners, vec3_t *colors, const size_t *count, mat4x4_t *model, 
+                                bool *on_water_surface, const struct map *map);
+
+/* ---------------------------------------------------------------------------
+ * Render an array of 2d vectors over the map surface. The positions are 
+ * specified in chunk coordinates.
+ * ---------------------------------------------------------------------------
+ */
+void   R_GL_DrawFlowField(vec2_t *xz_positions, vec2_t *xz_directions, const size_t *count,
+                          mat4x4_t *model, const struct map *map);
+
+/* ---------------------------------------------------------------------------
+ * Update shader uniforms for Screenspace rendering. This function should be
+ * called after all 3D rendering has completed and before any screenspace 
+ * rendering. After it has been called, all rendered triangles should have 
+ * 0 z-dimention. The x and y dimentions correspond to screenspace coordinates.
+ * ---------------------------------------------------------------------------
+ */
+void   R_GL_SetScreenspaceDrawMode(void);
+
+/* ---------------------------------------------------------------------------
+ * Render the loading screen image over the entire viewport. This will configure
+ * the OpenGL state for screenspace rendering.
+ * ---------------------------------------------------------------------------
+ */
+void   R_GL_DrawLoadingScreen(const char *path);
+
+/* ---------------------------------------------------------------------------
+ * Draws the healthbars for the following 'num_ents'. 'ent_health_pc' must be
+ * initialized to a buffer of 'num_ents' floats (health percentages) and 
+ * 'ent_top_pos_ws' must be initialized to a buffer of 'num_ents' worldspace
+ * positions (the top center of the entity's OBB).
+ * ---------------------------------------------------------------------------
+ */
+void   R_GL_DrawHealthbars(const size_t *num_ents, GLfloat *ent_health_pc, 
+                           vec3_t *ent_top_pos_ws, int *yoffsets, const struct camera *cam);
+
+/* ---------------------------------------------------------------------------
+ * Render an entity's combined hybrid reciprocal velocity obstacle. (the union
+ * of all dynamic neighbours' HRVOs and static neighbours' VOs). There should
+ * be exactly 'num_vos' elements in the 'apexes' 'left_rays' and 'right_rays'
+ * input arrays.
+ * ---------------------------------------------------------------------------
+ */
+void   R_GL_DrawCombinedHRVO(vec2_t *apexes, vec2_t *left_rays, vec2_t *right_rays, 
+                             const size_t *num_vos, const struct map *map);
+
+/* ---------------------------------------------------------------------------
+ * Get a nanosecond-resolution GPU timestamp for a previously created
+ * cookie. The cookie is invalidated.
+ * ---------------------------------------------------------------------------
+ */
+void   R_GL_TimestampForCookie(uint32_t *cookie, uint64_t *out);
+
+/* ---------------------------------------------------------------------------
+ * Read the GPU's VRAM usage counters (NVX_gpu_memory_info) into 'out', or
+ * zeroes if the extension is unavailable.
+ * ---------------------------------------------------------------------------
+ */
+struct vram_stats;
+void   R_GL_ReadVramStats(struct vram_stats *out);
+
+/* ---------------------------------------------------------------------------
+ * GPU pipeline-statistics (GL_ARB_pipeline_statistics_query) for one frame.
+ * 'cookies' holds PERF_GPU_STAT_COUNT caller-owned query handles. Begin opens a
+ * whole-frame span, End closes it, and Resolve reads a deferred (non-stalling)
+ * slot into 'out' and frees the handles. All zero when the extension is absent.
+ * ---------------------------------------------------------------------------
+ */
+struct gpu_frame_stats;
+void   R_GL_PipelineStatsBegin(uint32_t *cookies);
+void   R_GL_PipelineStatsEnd(void);
+void   R_GL_ResolvePipelineStats(uint32_t *cookies, struct gpu_frame_stats *out);
+
+/* ---------------------------------------------------------------------------
+ * Snapshot the engine's tracked GPU allocations (per render-file system, split
+ * into texture/renderbuffer/bufferobject) into 'out'. The counters are
+ * maintained by the gl_mem.h wrapper macros as GL objects are allocated/freed.
+ * ---------------------------------------------------------------------------
+ */
+void   R_GL_GetMemoryAccounting(struct gpu_mem_accounting *out);
+
+/*###########################################################################*/
+/* RENDER TILES                                                              */
+/*###########################################################################*/
+
+/* ---------------------------------------------------------------------------
+ * Draws a colored outline around the tile specified by the descriptor.
+ * ---------------------------------------------------------------------------
+ */
+void   R_GL_TileDrawSelected(const struct tile_desc *in, const struct map *map, mat4x4_t *model);
+
+
+/* ---------------------------------------------------------------------------
+ * Update a batch of tiles with new attributes and buffer the new vertex data.
+ * All 'num_descs' tile descriptors must belong to the chunk identified by
+ * 'chunk_rprivate'.
+ * ---------------------------------------------------------------------------
+ */
+void   R_GL_TileUpdate(void *chunk_rprivate, const struct map *map,
+                       const struct tile_desc *descs, const size_t *num_descs);
+
+/*###########################################################################*/
+/* RENDER MINIMAP                                                            */
+/*###########################################################################*/
+
+/* ---------------------------------------------------------------------------
+ * Will create a texture and mesh for the map and store them in a local context
+ * for rendering later.
+ * ---------------------------------------------------------------------------
+ */
+void  R_GL_MinimapBake(const struct map *map, void **chunk_rprivates, 
+                       mat4x4_t *chunk_model_mats);
+
+/* ---------------------------------------------------------------------------
+ * Update a chunk-sized region of the minimap texture with up-to-date mesh 
+ * data.
+ * ---------------------------------------------------------------------------
+ */
+void  R_GL_MinimapUpdateChunk(const struct map *map, void *chunk_rprivate, 
+                              mat4x4_t *chunk_model, const int *chunk_r, const int *chunk_c);
+
+/* ---------------------------------------------------------------------------
+ * Render the minimap centered at the specified (virtual) screenscape coordinate.
+ * The map's virtual minimap resolution will be used. This function will also 
+ * render a box over the minimap that indicates the region currently visible by 
+ * the specified camera. If camera is NULL, no box is drawn.
+ * ---------------------------------------------------------------------------
+ */
+void  R_GL_MinimapRender(const struct map *map, const struct camera *cam, 
+                         vec2_t *center_pos, const int *side_len_px, vec4_t *border_clr);
+
+/* ---------------------------------------------------------------------------
+ * Render the specified unit positions in the minimap region.
+ * ---------------------------------------------------------------------------
+ */
+void  R_GL_MinimapRenderUnits(const struct map *map, vec2_t *center_pos, 
+                              const int *side_len_px, size_t *nunits, 
+                              vec2_t *posbuff, vec3_t *colorbuff);
+
+/* ---------------------------------------------------------------------------
+ * Free the memory allocated by 'R_GL_MinimapBake'.
+ * ---------------------------------------------------------------------------
+ */
+void  R_GL_MinimapFree(void);
+
+/* ---------------------------------------------------------------------------
+ * Rebuild every tile of a chunk with the attributes that depend on the
+ * neighbouring tiles (material adjacency for blending, smoothed normals)
+ * and upload the chunk's vertex data in one go.
+ * ---------------------------------------------------------------------------
+ */
+void  R_GL_TilePatchChunk(void *chunk_rprivate, const struct map *map, const int *chunk_r, const int *chunk_c);
+
+/*###########################################################################*/
+/* RENDER TERRAIN                                                            */
+/*###########################################################################*/
+
+/* ---------------------------------------------------------------------------
+ * Initialize map texture array with the specified list of textures.
+ * ---------------------------------------------------------------------------
+ */
+void  R_GL_MapInit(const char map_texfiles[][256], const size_t *num_textures, 
+                   const struct map_resolution *res);
+
+/* ---------------------------------------------------------------------------
+ * Free the resources reserved by R_GL_MapInit.
+ * ---------------------------------------------------------------------------
+ */
+void  R_GL_MapShutdown(void);
+
+/* ---------------------------------------------------------------------------
+ * Call prior to rendering any map chunks. Activates the map rendering context.
+ * Must be followed with a matching call to 'R_GL_MapEnd'.
+ * ---------------------------------------------------------------------------
+ */
+void  R_GL_MapBegin(const bool *shadows, const vec2_t *pos,
+                    size_t *num_splats, const struct splatmap *splatmap);
+
+/* ---------------------------------------------------------------------------
+ * Call after finishing rendering all map chunks.
+ * ---------------------------------------------------------------------------
+ */
+void  R_GL_MapEnd(void);
+
+/* ---------------------------------------------------------------------------
+ * Send the current-frame fog-of-war information to the rendering susbsystem.
+ * ---------------------------------------------------------------------------
+ */
+void  R_GL_MapUpdateFog(void *buff, const size_t *size);
+
+/* ---------------------------------------------------------------------------
+ * Must be Called once per frame when we are sure there will be no more draw
+ * commands touching the map data.
+ * ---------------------------------------------------------------------------
+ */
+void  R_GL_MapInvalidate(void);
+
+/* ---------------------------------------------------------------------------
+ * Set the resolution of the baked chunk layers and whether they are stored
+ * compressed. Frees the current pool; it is re-created by the next bake.
+ * ---------------------------------------------------------------------------
+ */
+void  R_GL_TerrainBakeConfigure(const int *res, const bool *compress);
+
+/* ---------------------------------------------------------------------------
+ * Render one quadrant of a chunk's top-down bake into the scratch target.
+ * ---------------------------------------------------------------------------
+ */
+void  R_GL_TerrainBakeSlice(const struct terrain_bake_slice *slice);
+
+/* ---------------------------------------------------------------------------
+ * Mipmap the completed scratch bake and store it in the pool layer.
+ * ---------------------------------------------------------------------------
+ */
+void  R_GL_TerrainBakeFinish(const int *layer);
+
+/* ---------------------------------------------------------------------------
+ * Initialize the foliage rendering context. Sets up the shared mesh VAO and
+ * allocates per-chunk VBO slots. 'priv' is the render_private of the cover
+ * mesh; 'num_chunks' is the total map chunk count.
+ * ---------------------------------------------------------------------------
+ */
+void  R_GL_MapFoliageInit(void *priv, const size_t *num_chunks);
+
+/* ---------------------------------------------------------------------------
+ * Upload or update instance data for one chunk. 'positions' and 'rotations'
+ * may be NULL when *count is 0.
+ * ---------------------------------------------------------------------------
+ */
+void  R_GL_MapFoliageSetChunk(const size_t *chunk_idx, const vec3_t *positions,
+                              const float *rotations, const size_t *count);
+
+/* ---------------------------------------------------------------------------
+ * Free all resources claimed by R_GL_MapFoliageInit.
+ * ---------------------------------------------------------------------------
+ */
+void  R_GL_MapFoliageShutdown(void);
+
+/* ---------------------------------------------------------------------------
+ * Per-frame draw sequence: call BeginDraw once, then DrawChunk for each
+ * visible chunk, then EndDraw.
+ * ---------------------------------------------------------------------------
+ */
+void  R_GL_MapFoliageBeginDraw(const struct camera *cam, const float *scale,
+                               const struct map_resolution *res, const vec2_t *map_pos);
+void  R_GL_MapFoliageDrawChunk(const size_t *chunk_idx);
+void  R_GL_MapFoliageEndDraw(void);
+
+/*###########################################################################*/
+/* RENDER SHADOWS                                                            */
+/*###########################################################################*/
+
+/* ---------------------------------------------------------------------------
+ * Set up the rendering context for the depth pass. This _must_ be called
+ * before any calls to 'R_GL_RenderDepthMap'. Afterwards, there _must_ be 
+ * a matching call to 'R_GL_DepthPassEnd'.
+ * ---------------------------------------------------------------------------
+ */
+void R_GL_DepthPassBegin(const vec3_t *light_pos, const struct camera *cam);
+void R_GL_DepthPassBeginCustom(const mat4x4_t *light_space_trans);
+
+/* ---------------------------------------------------------------------------
+ * Set up the rendering context for normal rendering. This _must_ be called
+ * after all calls to 'R_GL_RenderDepthMap' complete.
+ * ---------------------------------------------------------------------------
+ */
+void R_GL_DepthPassEnd(void);
+
+/* ---------------------------------------------------------------------------
+ * Update the depth map for the mesh. The depth map will then be used for 
+ * rendering shadows on the 'regular' render pass.
+ * ---------------------------------------------------------------------------
+ */
+void R_GL_RenderDepthMap(const void *render_private, mat4x4_t *model);
+
+/* ---------------------------------------------------------------------------
+ * Return the frustum of the light source used for rendering the shadow map.
+ * An up-to-date frustum is generated during 'R_GL_DepthPassBegin'
+ * ---------------------------------------------------------------------------
+ */
+void R_GL_GetLightFrustum(struct frustum *out);
+
+/* ---------------------------------------------------------------------------
+ * Disable or enable shadows.
+ * ---------------------------------------------------------------------------
+ */
+void R_GL_SetShadowsEnabled(const bool *on);
+
+/*###########################################################################*/
+/* RENDER WATER                                                              */
+/*###########################################################################*/
+
+/* ---------------------------------------------------------------------------
+ * Initialize the water rendering context.
+ * ---------------------------------------------------------------------------
+ */
+void R_GL_WaterInit(void);
+
+/* ---------------------------------------------------------------------------
+ * Free all resources claimed by 'R_GL_WaterInit'
+ * ---------------------------------------------------------------------------
+ */
+void R_GL_WaterShutdown(void);
+
+/* ---------------------------------------------------------------------------
+ * Renders the water layer for the given map.
+ * ---------------------------------------------------------------------------
+ */
+void R_GL_DrawWater(const struct render_input *in, const bool *refraction, const bool *reflection);
+
+
+/*###########################################################################*/
+/* RENDER UI                                                                 */
+/*###########################################################################*/
+
+/* ---------------------------------------------------------------------------
+ * Initialize UI rendering context.
+ * ---------------------------------------------------------------------------
+ */
+void R_GL_UI_Init(void);
+
+/* ---------------------------------------------------------------------------
+ * Tear down UI rendering context. (free resources claimed by R_GL_UI_Init)
+ * ---------------------------------------------------------------------------
+ */
+void R_GL_UI_Shutdown(void);
+
+/* ---------------------------------------------------------------------------
+ * Render the UI from the draw commands generated by the nukear calls during
+ * a single simulation tick.
+ * ---------------------------------------------------------------------------
+ */
+void R_GL_UI_Render(const struct nk_draw_list *dl);
+
+/* ---------------------------------------------------------------------------
+ * Upload the specified font atlas texture
+ * ---------------------------------------------------------------------------
+ */
+void R_GL_UI_UploadFontAtlas(void *image, const int *w, const int *h);
+
+
+/*###########################################################################*/
+/* RENDER BATCH                                                              */
+/*###########################################################################*/
+
+/* ---------------------------------------------------------------------------
+ * Draw all the camera-visible entities in the render input, coalescing the
+ * draw commands into instanced multi-draws to reduce driver overhead. The
+ * vertex and texture data is sourced from the shared batch storage, into which
+ * every entity mesh is uploaded at load time.
+ * ---------------------------------------------------------------------------
+ */
+void R_GL_Batch_Draw(struct render_input *in);
+
+/* ---------------------------------------------------------------------------
+ * Update the depth map for every light-visible entity in the render input.
+ * This is the equivalent of calling R_GL_RenderDepthMap(...) for every
+ * light-visible entity.
+ * ---------------------------------------------------------------------------
+ */
+void R_GL_Batch_RenderDepthMap(struct render_input *in);
+
+
+/*###########################################################################*/
+/* RENDER MOVEMENT                                                           */
+/*###########################################################################*/
+
+/* The GPU velocity solve's buffers, persistently mapped: the CPU writes the
+ * inputs and reads the results back through these, with the capacities in
+ * bytes. Laid out as shaders/compute/movement.glsl reads them.
+ */
+struct gpu_move_bufs{
+    void       *units;
+    void       *nbs;
+    void       *patch;
+    const void *results;
+    size_t      units_cap;
+    size_t      nbs_cap;
+    size_t      patch_cap;
+    size_t      results_cap;
+};
+
+/* ---------------------------------------------------------------------------
+ * (Re)create the movement buffers with at least the given capacities (units,
+ * neighbours, patch words, results, in bytes), write their mappings to 'out',
+ * and set 'done'. The mappings are NULL if the buffers could not be created.
+ * ---------------------------------------------------------------------------
+ */
+void R_GL_MoveReserve(const size_t *caps, struct gpu_move_bufs *out, SDL_atomic_t *done);
+
+/* When a posted solve was dispatched and signalled (performance counter
+ * ticks), and its GPU time.
+ */
+struct gpu_move_times{
+    uint64_t dispatched;
+    uint64_t signalled;
+    uint32_t gpu_us;
+};
+
+/* ---------------------------------------------------------------------------
+ * Post the velocity solve for the first 'nwork' units of the mapped inputs,
+ * from the one thread that posts; the render thread dispatches the latest
+ * post at its next frame boundary. 'done' is set to 'seq' once the results
+ * are visible through the mapping, after the solve's times are written to
+ * 'out_times', if not NULL.
+ * ---------------------------------------------------------------------------
+ */
+void R_GL_MovePost(const struct map_resolution *res, vec2_t nav_pos, int nwork,
+                   SDL_atomic_t *done, int seq, struct gpu_move_times *out_times);
+
+/* ---------------------------------------------------------------------------
+ * Signal a dispatched solve that has finished, and at a frame 'boundary',
+ * where no command's GL state is live, dispatch a posted one. Called by the
+ * render thread around and between each frame's commands.
+ * ---------------------------------------------------------------------------
+ */
+void R_GL_MovePoll(bool boundary);
+
+/* ---------------------------------------------------------------------------
+ * Clean up any OpenGL resources allocated by the movement system.
+ * ---------------------------------------------------------------------------
+ */
+void R_GL_MoveClearState(void);
+
+/*###########################################################################*/
+/* RENDER SKYBOX                                                             */
+/*###########################################################################*/
+
+/* ---------------------------------------------------------------------------
+ * Load the images for all the skybox faces and set up the rendering state.
+ * ---------------------------------------------------------------------------
+ */
+void R_GL_SkyboxLoad(const char *dir, const char *extension);
+
+/* ---------------------------------------------------------------------------
+ * Render the skybox.
+ * ---------------------------------------------------------------------------
+ */
+void R_GL_DrawSkybox(const struct camera *cam);
+
+/* ---------------------------------------------------------------------------
+ * Release GPU resources used by the skybox.
+ * ---------------------------------------------------------------------------
+ */
+void R_GL_SkyboxFree(void);
+
+/*###########################################################################*/
+/* RENDER ANIM                                                               */
+/*###########################################################################*/
+
+/* ---------------------------------------------------------------------------
+ * Append pose data to a buffer holding all animation poses for all models.
+ * ---------------------------------------------------------------------------
+ */
+void R_GL_AnimAppendData(GLfloat *data, size_t *size);
+
+/* ---------------------------------------------------------------------------
+ * Set OpenGL uniforms for animation-related shader programs.
+ * ---------------------------------------------------------------------------
+ */
+void   R_GL_AnimSetUniforms(mat4x4_t *normal_mat, struct anim_pose_data_desc *desc);
+
+/*###########################################################################*/
+/* RENDER SWAPCHAIN                                                          */
+/*###########################################################################*/
+
+void R_GL_SwapchainPresentLast(void);
+
+/*###########################################################################*/
+/* RENDER SPRITE                                                             */
+/*###########################################################################*/
+
+/* Load and upload a sprite sheet texture ahead of its first draw; a cold
+ * sheet decoded at draw time stalls the render thread mid-frame.
+ */
+void R_GL_SpritePreloadSheet(const char *filename);
+
+void R_GL_SpriteRenderBatch(struct sprite_desc *sprites, size_t *nsprites,
+                            const struct camera *cam);
+
+/*###########################################################################*/
+/* RENDER BILLBOARD                                                          */
+/*###########################################################################*/
+
+struct bb_model_desc;
+struct bb_variant;
+struct anim_data;
+
+/* ---------------------------------------------------------------------------
+ * Main-thread registry of billboard atlas descriptors, keyed by the model's
+ * base render_private. Registration computes the descriptor (cell layout,
+ * framing, cache tag) but does not touch the GPU; EnsureBaked enqueues the
+ * render-thread bake. Get returns NULL until the atlas is resident.
+ * ---------------------------------------------------------------------------
+ */
+bool R_Billboard_Init(void);
+void R_Billboard_Shutdown(void);
+void R_Billboard_Register(void *render_key, const char *basedir, const char *filename,
+                          const struct aabb *aabb, const struct anim_data *anim_data);
+const struct bb_model_desc *R_Billboard_Get(void *render_key);
+/* An entity scaled so large that its sprite would fall below the density
+ * floor keeps rendering as a mesh.
+ */
+bool R_Billboard_ScaleEligible(const struct bb_model_desc *desc, vec2_t scale);
+int  R_Billboard_CellBase(const struct bb_model_desc *desc, int clip_idx, int frame_idx);
+void R_Billboard_EnsureBaked(void *render_key);
+void R_Billboard_EnsureAllBaked(void);
+
+/* ---------------------------------------------------------------------------
+ * Once-per-frame pump: when the wanted bake variant changes (the shadows
+ * setting, or a material change of the global light), enqueue re-bakes for
+ * stale atlases, capped per frame. The old atlas keeps drawing until its
+ * replacement lands.
+ * ---------------------------------------------------------------------------
+ */
+void R_Billboard_Tick(void);
+
+/* ---------------------------------------------------------------------------
+ * Bake the given variant of a model's atlas, or upload it from the impostor
+ * cache, replacing the resident atlas if there is one.
+ * ---------------------------------------------------------------------------
+ */
+void R_GL_Billboard_EnsureBaked(struct bb_model_desc *desc, const void *render_private,
+                                const struct bb_variant *var, const int *gen);
+
+/* ---------------------------------------------------------------------------
+ * Render every entity in the input's billboard list, one instanced draw call
+ * per distinct model. The list must be sorted by descriptor.
+ * ---------------------------------------------------------------------------
+ */
+void R_GL_Billboard_Draw(struct render_input *in);
+void R_GL_Billboard_DrawDepth(struct render_input *in);
+
+#endif
+

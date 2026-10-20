@@ -1,0 +1,1089 @@
+/*
+ *  This file is part of Permafrost Engine. 
+ *  Copyright (C) 2020-2023 Eduard Permyakov 
+ *
+ *  Permafrost Engine is free software: you can redistribute it and/or modify
+ *  it under the terms of the GNU General Public License as published by
+ *  the Free Software Foundation, either version 3 of the License, or
+ *  (at your option) any later version.
+ *
+ *  Permafrost Engine is distributed in the hope that it will be useful,
+ *  but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *  GNU General Public License for more details.
+ *
+ *  You should have received a copy of the GNU General Public License
+ *  along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ * 
+ *  Linking this software statically or dynamically with other modules is making 
+ *  a combined work based on this software. Thus, the terms and conditions of 
+ *  the GNU General Public License cover the whole combination. 
+ *  
+ *  As a special exception, the copyright holders of Permafrost Engine give 
+ *  you permission to link Permafrost Engine with independent modules to produce 
+ *  an executable, regardless of the license terms of these independent 
+ *  modules, and to copy and distribute the resulting executable under 
+ *  terms of your choice, provided that you also meet, for each linked 
+ *  independent module, the terms and conditions of the license of that 
+ *  module. An independent module is a module which is not derived from 
+ *  or based on Permafrost Engine. If you modify Permafrost Engine, you may 
+ *  extend this exception to your version of Permafrost Engine, but you are not 
+ *  obliged to do so. If you do not wish to do so, delete this exception 
+ *  statement from your version.
+ *
+ */
+
+#define MEM_FILE_SYS MEM_SYS_PERF
+#define MEM_FILE_SUB 0
+#define PERF_INTERNAL
+
+#include "perf.h"
+#include "main.h"
+#include "lib/public/khash.h"
+#include "lib/public/vec.h"
+#include "lib/public/pf_string.h"
+#include "render/public/render.h"
+#include "render/public/render_ctrl.h"
+#include "render/gl_mem.h"
+#include "settings.h"
+
+#include <mimalloc-stats.h>
+
+#include <assert.h>
+#include <stdio.h>
+#include <string.h>
+#include <stdint.h>
+#include <SDL_atomic.h>
+
+#if defined(__linux__) && !defined(NDEBUG)
+#include <linux/perf_event.h>
+#include <sys/syscall.h>
+#include <sys/ioctl.h>
+#include <unistd.h>
+#include <errno.h>
+#endif
+
+#include "mem.h"
+
+#undef PF_MALLOC
+#undef PF_CALLOC
+#undef PF_REALLOC
+#define PF_MALLOC(_n)       PF_MALLOC_TAGGED((_n), MEM_SYS_PERF, 0)
+#define PF_CALLOC(_c, _n)   PF_CALLOC_TAGGED((_c), (_n), MEM_SYS_PERF, 0)
+#define PF_REALLOC(_p, _n)  PF_REALLOC_TAGGED((_p), (_n), MEM_SYS_PERF, 0)
+
+
+#define PARENT_NONE     ~((uint32_t)0)
+#define GPU_STATE_NAME  "GPU"
+#define GPU_STATE_KEY   UINT64_MAX
+#define GPU_TIMER_HZ    (1 * 1000 * 1000 * 1000)
+#define LOG_FREQUENCY      (60)
+#define SLOW_FRAME_DUMP_MS (40)
+
+#if defined(__linux__) && !defined(NDEBUG)
+enum {
+    PE_CYCLES = 0,
+    PE_INSTR,
+    PE_BRANCH,
+    PE_BRANCH_MISS,
+    PE_L1D_REF,
+    PE_L1D_MISS,
+    PE_LLC_REF,
+    PE_LLC_MISS,
+    PE_COUNT
+};
+#endif
+
+struct perf_entry{
+    union{
+        uint64_t pc_delta;
+        struct{
+            struct{
+                uint64_t gpu_cookie;
+                uint64_t gpu_ts;
+            }begin, end;
+        };
+    };
+    uint32_t parent_idx;
+    uint32_t name_id;
+#if defined(__linux__) && !defined(NDEBUG)
+    uint64_t hw_counters[PE_COUNT];
+#endif
+};
+
+#ifndef NDEBUG
+#undef PERF_ENTER
+#undef PERF_RETURN
+#define PERF_ENTER()
+#define PERF_RETURN(...) do {return (__VA_ARGS__); } while(0)
+#endif
+
+KHASH_MAP_INIT_STR(name_id, uint32_t)
+KHASH_MAP_INIT_INT(id_name, const char *)
+
+VEC_TYPE(perf, struct perf_entry)
+VEC_IMPL(static inline, perf, struct perf_entry)
+
+VEC_TYPE(idx, uint32_t)
+VEC_IMPL(static inline, idx, uint32_t)
+
+struct perf_state{
+    char              name[64];
+    /* The next name ID to hand out 
+     */
+    uint32_t          next_id;
+    /* Keep a mapping of function_name: unique_ID and a reverse-mapping. 
+     * These should (mostly) get populated during the first frame.
+     */
+    khash_t(name_id) *name_id_table;
+    khash_t(id_name) *id_name_table;
+    /* The callstack of profiled functions. As enties are popped, the
+     * entries for the corresponding index are updated in the perf tree. 
+     */
+    vec_idx_t         perf_stack;
+    /* The perf tree gets a new entry for each profiled function call.
+     * As such, the function calls are added in depth-first fashion.
+     */
+    int               perf_tree_idx;
+    vec_perf_t        perf_trees[NFRAMES_LOGGED];
+    /* GPU-only: size of each tree slot when its cookies were last
+     * scheduled for read. Prevents double-consume on wraparound. */
+    size_t            last_read_size[NFRAMES_LOGGED];
+#if defined(__linux__) && !defined(NDEBUG)
+    /* perf_event_open group leader + 7 followers; opened lazily by the
+     * thread itself on its first Perf_Push so the kernel attaches them
+     * to the right thread. */
+    int               hw_fds[PE_COUNT];
+    bool              hw_fds_inited;
+    bool              hw_init_attempted;
+#endif
+};
+
+KHASH_MAP_INIT_INT64(pstate, struct perf_state)
+
+/*****************************************************************************/
+/* STATIC VARIABLES                                                          */
+/*****************************************************************************/
+
+static khash_t(pstate) *s_thread_state_table;
+
+static int                    s_last_idx = 0;
+static unsigned               s_last_frames_ms[NFRAMES_LOGGED];
+static uint64_t               s_frame_start_pc;
+static struct perf_mem_stats  s_last_frames_memstats[NFRAMES_LOGGED];
+static struct mem_accounting
+                              s_last_frames_accounting[NFRAMES_LOGGED];
+static uint64_t               s_last_frames_allocd_bytes[NFRAMES_LOGGED];
+static struct vram_stats      s_vram[NFRAMES_LOGGED];
+static struct gpu_mem_accounting s_gpu_accounting[NFRAMES_LOGGED];
+static uint32_t               s_gpu_stat_cookies[NFRAMES_LOGGED][PERF_GPU_STAT_COUNT];
+static bool                   s_gpu_stat_valid[NFRAMES_LOGGED];
+static struct gpu_frame_stats s_gpu_frame_stats[NFRAMES_LOGGED];
+static struct billboard_frame_stats s_bill_stats[NFRAMES_LOGGED];
+
+static struct nav_tick_sample s_nav_tick_hist[PERF_NAV_TICK_HISTORY];
+static size_t                 s_nav_tick_head;
+static size_t                 s_nav_tick_count;
+static uint32_t               s_nav_tick_seq;
+
+static struct frame_time_sample s_frame_time_hist[PERF_FRAME_HISTORY];
+static size_t                   s_frame_time_head;
+static size_t                   s_frame_time_count;
+static uint32_t                 s_frame_time_seq;
+static SDL_atomic_t           s_nav_parallel_us;
+/* Hardware counter sampling at every probe push/pop costs two read() syscalls
+ * per scope; keep it opt-in so instrumented builds stay representative.
+ */
+static bool                   s_hw_counters;
+
+/*****************************************************************************/
+/* STATIC FUNCTIONS                                                          */
+/*****************************************************************************/
+
+#if defined(__linux__) && !defined(NDEBUG)
+
+static long perf_event_open_sys(struct perf_event_attr *attr, pid_t pid,
+                                int cpu, int group_fd, unsigned long flags)
+{
+    return syscall(__NR_perf_event_open, attr, pid, cpu, group_fd, flags);
+}
+
+static uint64_t hw_cache_cfg(uint32_t id, uint32_t op, uint32_t result)
+{
+    return (uint64_t)id | ((uint64_t)op << 8) | ((uint64_t)result << 16);
+}
+
+static int hw_perf_open_one(uint32_t type, uint64_t config, int group_fd)
+{
+    struct perf_event_attr attr;
+    memset(&attr, 0, sizeof(attr));
+    attr.type           = type;
+    attr.size           = sizeof(attr);
+    attr.config         = config;
+    attr.disabled       = (group_fd == -1) ? 1 : 0; /* only leader starts disabled */
+    attr.exclude_kernel = 1;
+    attr.exclude_hv     = 1;
+    attr.read_format    = PERF_FORMAT_GROUP;
+    /* pid=0 attaches the event to the calling thread. */
+    return (int)perf_event_open_sys(&attr, 0, -1, group_fd, 0);
+}
+
+static void hw_perf_open_thread(struct perf_state *ps)
+{
+    struct{
+        uint32_t type; 
+        uint64_t cfg; 
+        const char *name; 
+    }evts[PE_COUNT] = {
+
+        [PE_CYCLES]      = { PERF_TYPE_HARDWARE, PERF_COUNT_HW_CPU_CYCLES,         "cycles" },
+        [PE_INSTR]       = { PERF_TYPE_HARDWARE, PERF_COUNT_HW_INSTRUCTIONS,       "instructions" },
+        [PE_BRANCH]      = { PERF_TYPE_HARDWARE, PERF_COUNT_HW_BRANCH_INSTRUCTIONS,"branches" },
+        [PE_BRANCH_MISS] = { PERF_TYPE_HARDWARE, PERF_COUNT_HW_BRANCH_MISSES,      "branch misses" },
+        [PE_L1D_REF]     = { PERF_TYPE_HW_CACHE,
+            hw_cache_cfg(PERF_COUNT_HW_CACHE_L1D, PERF_COUNT_HW_CACHE_OP_READ,
+                         PERF_COUNT_HW_CACHE_RESULT_ACCESS), "L1D refs" },
+        [PE_L1D_MISS]    = { PERF_TYPE_HW_CACHE,
+            hw_cache_cfg(PERF_COUNT_HW_CACHE_L1D, PERF_COUNT_HW_CACHE_OP_READ,
+                         PERF_COUNT_HW_CACHE_RESULT_MISS),   "L1D misses" },
+        [PE_LLC_REF]     = { PERF_TYPE_HW_CACHE,
+            hw_cache_cfg(PERF_COUNT_HW_CACHE_LL, PERF_COUNT_HW_CACHE_OP_READ,
+                         PERF_COUNT_HW_CACHE_RESULT_ACCESS), "LLC refs" },
+        [PE_LLC_MISS]    = { PERF_TYPE_HW_CACHE,
+            hw_cache_cfg(PERF_COUNT_HW_CACHE_LL, PERF_COUNT_HW_CACHE_OP_READ,
+                         PERF_COUNT_HW_CACHE_RESULT_MISS),   "LLC misses" },
+    };
+
+    for(int i = 0; i < PE_COUNT; i++)
+        ps->hw_fds[i] = -1;
+
+    for(int i = 0; i < PE_COUNT; i++) {
+        int group_fd = (i == 0) ? -1 : ps->hw_fds[0];
+        ps->hw_fds[i] = hw_perf_open_one(evts[i].type, evts[i].cfg, group_fd);
+        if(ps->hw_fds[i] < 0) {
+            fprintf(stderr,
+                "perf_event_open(%s) failed for thread '%s': %s\n",
+                evts[i].name, ps->name, strerror(errno));
+            for(int j = 0; j < PE_COUNT; j++) {
+                if(ps->hw_fds[j] >= 0)
+                    close(ps->hw_fds[j]);
+                ps->hw_fds[j] = -1;
+            }
+            return;
+        }
+    }
+
+    ioctl(ps->hw_fds[0], PERF_EVENT_IOC_RESET,  PERF_IOC_FLAG_GROUP);
+    ioctl(ps->hw_fds[0], PERF_EVENT_IOC_ENABLE, PERF_IOC_FLAG_GROUP);
+    ps->hw_fds_inited = true;
+}
+
+static void hw_perf_close_thread(struct perf_state *ps)
+{
+    if(!ps->hw_fds_inited)
+        return;
+    for(int i = 0; i < PE_COUNT; i++) {
+        if(ps->hw_fds[i] >= 0) close(ps->hw_fds[i]);
+        ps->hw_fds[i] = -1;
+    }
+    ps->hw_fds_inited = false;
+}
+
+static void hw_perf_read_thread(struct perf_state *ps, uint64_t out[PE_COUNT])
+{
+    if(!ps->hw_fds_inited) {
+        memset(out, 0, sizeof(uint64_t) * PE_COUNT);
+        return;
+    }
+    /* PERF_FORMAT_GROUP layout: nr, val0, val1, ... */
+    uint64_t buf[1 + PE_COUNT];
+    ssize_t n = read(ps->hw_fds[0], buf, sizeof(buf));
+    if(n != (ssize_t)sizeof(buf)) {
+        memset(out, 0, sizeof(uint64_t) * PE_COUNT);
+        return;
+    }
+    for(int i = 0; i < PE_COUNT; i++)
+        out[i] = buf[1 + i];
+}
+
+static void read_proc_statm(struct perf_mem_stats *out)
+{
+    FILE *f = fopen("/proc/self/statm", "r");
+    if(!f)
+        return;
+    unsigned long size_pages = 0, rss_pages = 0;
+    if(fscanf(f, "%lu %lu", &size_pages, &rss_pages) == 2) {
+        long pgsz = sysconf(_SC_PAGESIZE);
+        out->vm_size_kb = ((uint64_t)size_pages * (uint64_t)pgsz) / 1024;
+        out->vm_rss_kb  = ((uint64_t)rss_pages  * (uint64_t)pgsz) / 1024;
+    }
+    fclose(f);
+}
+
+#endif /* defined(__linux__) && !defined(NDEBUG) */
+
+static void gather_mem_stats(struct perf_mem_stats *out)
+{
+    memset(out, 0, sizeof(*out));
+
+    mi_stats_t mi = {0};
+    mi_stats_get(sizeof(mi_stats_t), &mi);
+    out->mi_malloc_normal_current = mi.malloc_normal.current;
+    out->mi_malloc_normal_total   = mi.malloc_normal.total;
+    out->mi_pages_current         = mi.pages.current;
+    out->mi_threads_current       = mi.threads.current;
+
+#if defined(__linux__) && !defined(NDEBUG)
+    read_proc_statm(out);
+#endif
+}
+
+static uint64_t tid_to_key(SDL_threadID tid)
+{
+    union{
+        SDL_threadID as_tid;
+        uint64_t     as_u64;
+    }ret = {0};
+    ret.as_tid = tid;
+    return ret.as_u64;
+}
+
+static uint32_t name_id_get(const char *name, struct perf_state *ps)
+{
+    khiter_t k = kh_get(name_id, ps->name_id_table, name);
+    if(k != kh_end(ps->name_id_table))
+        return kh_val(ps->name_id_table, k);
+
+    int status;
+    uint32_t new_id = ps->next_id++;
+    const char *copy = pf_strdup(name);
+    assert(copy);
+
+    kh_put(id_name, ps->id_name_table, new_id, &status);
+    assert(status != -1);
+    k = kh_get(id_name, ps->id_name_table, new_id);
+    kh_val(ps->id_name_table, k) = copy;
+
+    kh_put(name_id, ps->name_id_table, copy, &status);
+    assert(status != -1);
+    k = kh_get(name_id, ps->name_id_table, copy);
+    kh_val(ps->name_id_table, k) = new_id;
+
+    return new_id;
+}
+
+const char *name_for_id(struct perf_state *ps, uint32_t id)
+{
+    khiter_t k = kh_get(id_name, ps->id_name_table, id);
+    if(k != kh_end(ps->id_name_table))
+        return kh_val(ps->id_name_table, k);
+    return NULL;
+}
+
+static bool pstate_init(struct perf_state *out, const char *name)
+{
+    out->next_id = 0;
+    out->name_id_table = kh_init(name_id);
+    if(!out->name_id_table)
+        goto fail_name_id;
+    out->id_name_table = kh_init(id_name);
+    if(!out->id_name_table)
+        goto fail_id_name;
+    vec_idx_init(&out->perf_stack);
+    if(!vec_idx_resize(&out->perf_stack, 4096))
+        goto fail_perf_stack;
+
+    for(int i = 0; i < NFRAMES_LOGGED; i++) {
+    
+        vec_perf_init(&out->perf_trees[i]);
+        if(!vec_perf_resize(&out->perf_trees[i], 32768))
+            goto fail_perf_trees;
+    }
+
+    pf_strlcpy(out->name, name, sizeof(out->name));
+    out->perf_tree_idx = 0;
+    memset(out->last_read_size, 0, sizeof(out->last_read_size));
+#if defined(__linux__) && !defined(NDEBUG)
+    for(int i = 0; i < PE_COUNT; i++)
+        out->hw_fds[i] = -1;
+    out->hw_fds_inited = false;
+    out->hw_init_attempted = false;
+#endif
+    return true;
+
+fail_perf_trees:
+    for(int i = 0; i < NFRAMES_LOGGED; i++) {
+
+        if(!out->perf_trees[i].array)
+            continue;
+        vec_perf_destroy(&out->perf_trees[i]);
+    }
+    vec_idx_destroy(&out->perf_stack);
+fail_perf_stack:
+    kh_destroy(id_name, out->id_name_table);
+fail_id_name:
+    kh_destroy(name_id, out->name_id_table);
+fail_name_id:
+    return false;
+}
+
+static void pstate_destroy(struct perf_state *in)
+{
+#if defined(__linux__) && !defined(NDEBUG)
+    hw_perf_close_thread(in);
+#endif
+
+    for(int i = 0; i < NFRAMES_LOGGED; i++) {
+        vec_perf_destroy(&in->perf_trees[i]);
+    }
+    vec_idx_destroy(&in->perf_stack);
+
+    uint32_t key;
+    const char *curr;
+    (void)key;
+
+    kh_foreach(in->id_name_table, key, curr, {
+        PF_FREE(curr);
+    });
+
+    kh_destroy(id_name, in->id_name_table);
+    kh_destroy(name_id, in->name_id_table);
+}
+
+static bool register_gpu_state(void)
+{
+    khiter_t k = kh_get(pstate, s_thread_state_table, GPU_STATE_KEY);
+    assert(k == kh_end(s_thread_state_table));
+
+    int status;
+    k = kh_put(pstate, s_thread_state_table, GPU_STATE_KEY, &status);
+    assert(status != -1 && status != 0);
+
+    if(!pstate_init(&kh_val(s_thread_state_table, k), GPU_STATE_NAME))
+        return false;
+    return true;
+}
+
+static int positive_modulo(int i, int n)
+{
+    return (i % n + n) % n;
+}
+
+static void perf_log_call_graph(size_t nthreads, struct perf_info **infos)
+{
+    fprintf(stdout, "[call-graph] === frame ===\n");
+    for(size_t i = 0; i < nthreads; i++) {
+
+        struct perf_info *info = infos[i];
+
+        double total = 0.0;
+        for(size_t j = 0; j < info->nentries; j++) {
+            if(info->entries[j].parent_idx < 0)
+                total += info->entries[j].ms_delta;
+        }
+
+        fprintf(stdout, "[call-graph] thread '%s' (%zu entries, %.3fms total)\n",
+            info->threadname, info->nentries, total);
+
+        for(size_t j = 0; j < info->nentries; j++) {
+
+            int depth = 0;
+            int p = info->entries[j].parent_idx;
+            while(p >= 0 && depth < 64) {
+                depth++;
+                p = info->entries[p].parent_idx;
+            }
+
+            fprintf(stdout, "[call-graph]   %*s%-40s %8.3fms"
+                " ipc=%.2f br_miss=%.2f%% l1d_miss=%.2f%% llc_miss=%.2f%%\n",
+                depth * 2, "", info->entries[j].funcname,
+                info->entries[j].ms_delta,
+                info->entries[j].hw_ipc,
+                info->entries[j].hw_br_miss,
+                info->entries[j].hw_l1d_miss,
+                info->entries[j].hw_llc_miss);
+        }
+    }
+    fflush(stdout);
+}
+
+static void perf_log_mem_stats(void)
+{
+    int read_idx = (s_last_idx + 1) % NFRAMES_LOGGED;
+    const struct perf_mem_stats *s = &s_last_frames_memstats[read_idx];
+
+    fprintf(stdout, "[mem-stats] === frame ===\n");
+    fprintf(stdout, "[mem-stats]   mi_malloc_normal_current  %12lld bytes\n",
+        (long long)s->mi_malloc_normal_current);
+    fprintf(stdout, "[mem-stats]   mi_pages_current          %12lld\n",
+        (long long)s->mi_pages_current);
+    fprintf(stdout, "[mem-stats]   mi_threads_current        %12lld\n",
+        (long long)s->mi_threads_current);
+    fprintf(stdout, "[mem-stats]   vm_rss                    %12llu kB\n",
+        (unsigned long long)s->vm_rss_kb);
+    fprintf(stdout, "[mem-stats]   vm_size                   %12llu kB\n",
+        (unsigned long long)s->vm_size_kb);
+    fflush(stdout);
+}
+
+/*****************************************************************************/
+/* EXTERN FUNCTIONS                                                          */
+/*****************************************************************************/
+
+bool Perf_Init(void)
+{
+    s_thread_state_table = kh_init(pstate);
+    if(!s_thread_state_table)
+        return false;
+    if(!register_gpu_state()) {
+        kh_destroy(pstate, s_thread_state_table);
+        return false;
+    }
+    assert(NFRAMES_LOGGED >= 3);
+    return true;
+}
+
+void Perf_Shutdown(void)
+{
+    uint64_t key;
+    struct perf_state curr;
+    (void)key;
+
+    kh_foreach(s_thread_state_table, key, curr, {
+        pstate_destroy(&curr);
+    });
+    kh_destroy(pstate, s_thread_state_table);
+}
+
+bool Perf_RegisterThread(SDL_threadID tid, const char *name)
+{
+    ASSERT_IN_MAIN_THREAD();
+
+    khiter_t k = kh_get(pstate, s_thread_state_table, tid_to_key(tid));
+    if(k != kh_end(s_thread_state_table))
+        return false;
+
+    int status;
+    kh_put(pstate, s_thread_state_table, tid_to_key(tid), &status);
+    if(status == -1)
+        return false;
+
+    k = kh_get(pstate, s_thread_state_table, tid_to_key(tid));
+    if(!pstate_init(&kh_val(s_thread_state_table, k), name))
+        return false;
+
+    return true;
+}
+
+void Perf_SetHWCountersEnabled(bool enabled)
+{
+    s_hw_counters = enabled;
+}
+
+void Perf_Push(const char *name)
+{
+    SDL_threadID tid = SDL_ThreadID();
+    khiter_t k = kh_get(pstate, s_thread_state_table, tid_to_key(tid));
+    if(k == kh_end(s_thread_state_table))
+        return;
+
+    struct perf_state *ps = &kh_val(s_thread_state_table, k);
+
+#if defined(__linux__) && !defined(NDEBUG)
+    /* Lazy-init the calling thread's HW counters on first Push so that
+     * perf_event_open() runs on the right thread.
+     */
+    if(s_hw_counters && !ps->hw_init_attempted) {
+        ps->hw_init_attempted = true;
+        hw_perf_open_thread(ps);
+    }
+#endif
+
+    const size_t ssize = vec_size(&ps->perf_stack);
+    uint32_t parent_idx = ssize > 0 ? vec_AT(&ps->perf_stack, ssize-1) : PARENT_NONE;
+
+    vec_perf_push(&ps->perf_trees[ps->perf_tree_idx], (struct perf_entry){
+        .pc_delta = SDL_GetPerformanceCounter(),
+        .parent_idx = parent_idx,
+        .name_id = name_id_get(name, ps)
+    });
+
+    uint32_t new_idx = vec_size(&ps->perf_trees[ps->perf_tree_idx])-1;
+#if defined(__linux__) && !defined(NDEBUG)
+    if(s_hw_counters) {
+        hw_perf_read_thread(ps, vec_AT(&ps->perf_trees[ps->perf_tree_idx], new_idx).hw_counters);
+    }
+#endif
+    vec_idx_push(&ps->perf_stack, new_idx);
+}
+
+void Perf_Pop(const char **out)
+{
+    if(out)
+        *out = NULL;
+
+    SDL_threadID tid = SDL_ThreadID();
+    khiter_t k = kh_get(pstate, s_thread_state_table, tid_to_key(tid));
+    if(k == kh_end(s_thread_state_table))
+        return;
+
+    struct perf_state *ps = &kh_val(s_thread_state_table, k);
+    if(vec_size(&ps->perf_stack) == 0)
+        return;
+
+    uint32_t idx = vec_idx_pop(&ps->perf_stack);
+    assert(idx < vec_size(&ps->perf_trees[ps->perf_tree_idx]));
+    struct perf_entry *pe = &vec_AT(&ps->perf_trees[ps->perf_tree_idx], idx);
+    pe->pc_delta = abs(SDL_GetPerformanceCounter() - pe->pc_delta);
+
+#if defined(__linux__) && !defined(NDEBUG)
+    if(s_hw_counters) {
+        uint64_t hw_end[PE_COUNT];
+        hw_perf_read_thread(ps, hw_end);
+        for(int i = 0; i < PE_COUNT; i++)
+            pe->hw_counters[i] = hw_end[i] - pe->hw_counters[i];
+    }
+#endif
+
+    if(out)
+        *out = name_for_id(ps, pe->name_id);
+}
+
+int Perf_StackSize(void)
+{
+    SDL_threadID tid = SDL_ThreadID();
+    khiter_t k = kh_get(pstate, s_thread_state_table, tid_to_key(tid));
+    if(k == kh_end(s_thread_state_table))
+        return -1;
+
+    struct perf_state *ps = &kh_val(s_thread_state_table, k);
+    return vec_size(&ps->perf_stack);
+}
+
+bool Perf_IsRoot(void)
+{
+    SDL_threadID tid = SDL_ThreadID();
+    khiter_t k = kh_get(pstate, s_thread_state_table, tid_to_key(tid));
+    if(k == kh_end(s_thread_state_table))
+        return false;
+
+    struct perf_state *ps = &kh_val(s_thread_state_table, k);
+    const size_t ssize = vec_size(&ps->perf_stack);
+
+    if(ssize == 0)
+        return true;
+
+    uint32_t idx = vec_AT(&ps->perf_stack, vec_size(&ps->perf_stack) - 1);
+    struct perf_entry *pe = &vec_AT(&ps->perf_trees[ps->perf_tree_idx], idx);
+    const char *name = name_for_id(ps, pe->name_id);
+    if(0 == strncmp(name, "Task ", 5))
+        return true;
+    return false;
+}
+
+void Perf_PushGPU(const char *name, uint32_t cookie)
+{
+    khiter_t k = kh_get(pstate, s_thread_state_table, GPU_STATE_KEY);
+    assert(k != kh_end(s_thread_state_table));
+
+    struct perf_state *ps = &kh_val(s_thread_state_table, k);
+    const size_t ssize = vec_size(&ps->perf_stack);
+    uint32_t parent_idx = ssize > 0 ? vec_AT(&ps->perf_stack, ssize-1) : PARENT_NONE;
+
+    vec_perf_push(&ps->perf_trees[ps->perf_tree_idx], (struct perf_entry){
+        .begin.gpu_cookie = cookie,
+        .parent_idx = parent_idx,
+        .name_id = name_id_get(name, ps)
+    });
+
+    uint32_t new_idx = vec_size(&ps->perf_trees[ps->perf_tree_idx])-1;
+    vec_idx_push(&ps->perf_stack, new_idx);
+}
+
+void Perf_PopGPU(uint32_t cookie)
+{
+    khiter_t k = kh_get(pstate, s_thread_state_table, GPU_STATE_KEY);
+    if(k == kh_end(s_thread_state_table))
+        return;
+
+    struct perf_state *ps = &kh_val(s_thread_state_table, k);
+    if(vec_size(&ps->perf_stack) == 0)
+        return;
+
+    uint32_t idx = vec_idx_pop(&ps->perf_stack);
+    assert(idx < vec_size(&ps->perf_trees[ps->perf_tree_idx]));
+    struct perf_entry *pe = &vec_AT(&ps->perf_trees[ps->perf_tree_idx], idx);
+    pe->end.gpu_cookie = cookie;
+}
+
+void Perf_BeginTick(void)
+{
+    ASSERT_IN_MAIN_THREAD();
+    s_last_frames_ms[s_last_idx] = SDL_GetTicks();
+    s_frame_start_pc = SDL_GetPerformanceCounter();
+
+    R_PushCmd((struct rcmd){
+        .func = R_GL_ReadVramStats,
+        .nargs = 1,
+        .args = { &s_vram[s_last_idx] }
+    });
+    R_PushCmd((struct rcmd){
+        .func = R_GL_GetMemoryAccounting,
+        .nargs = 1,
+        .args = { &s_gpu_accounting[s_last_idx] }
+    });
+    if(s_gpu_stat_valid[s_last_idx]) {
+        R_PushCmd((struct rcmd){
+            .func = R_GL_ResolvePipelineStats,
+            .nargs = 2,
+            .args = { &s_gpu_stat_cookies[s_last_idx][0], &s_gpu_frame_stats[s_last_idx] }
+        });
+    }
+    R_PushCmd((struct rcmd){
+        .func = R_GL_PipelineStatsBegin,
+        .nargs = 1,
+        .args = { &s_gpu_stat_cookies[s_last_idx][0] }
+    });
+    s_gpu_stat_valid[s_last_idx] = true;
+
+    khiter_t k = kh_get(pstate, s_thread_state_table, GPU_STATE_KEY);
+    if(k == kh_end(s_thread_state_table))
+        return;
+
+    struct perf_state *gpu_ps = &kh_val(s_thread_state_table, k);
+
+    /* commands are just queued now, to be executed next tick when the
+     * perf_tree_idx moves forward by 1 */
+    int write_idx = (gpu_ps->perf_tree_idx + 3) % NFRAMES_LOGGED;
+
+    size_t curr = vec_size(&gpu_ps->perf_trees[write_idx]);
+    size_t prev = gpu_ps->last_read_size[write_idx];
+    if(curr == prev)
+        return;
+
+    for(size_t i = prev; i < curr; i++) {
+
+        struct perf_entry *pe = &vec_AT(&gpu_ps->perf_trees[write_idx], i);
+
+        /* Cookie copied by value so a later slot reset can't re-target
+         * the queued read at a freshly-generated cookie. */
+        uint32_t bcookie = pe->begin.gpu_cookie;
+        uint32_t ecookie = pe->end.gpu_cookie;
+
+        R_PushCmd((struct rcmd){
+            .func = R_GL_TimestampForCookie,
+            .nargs = 2,
+            .args = {
+                R_PushArg(&bcookie, sizeof(uint32_t)),
+                &pe->begin.gpu_ts,
+            }
+        });
+        R_PushCmd((struct rcmd){
+            .func = R_GL_TimestampForCookie,
+            .nargs = 2,
+            .args = {
+                R_PushArg(&ecookie, sizeof(uint32_t)),
+                &pe->end.gpu_ts,
+            }
+        });
+    }
+    gpu_ps->last_read_size[write_idx] = curr;
+}
+
+void Perf_FinishTick(void)
+{
+    ASSERT_IN_MAIN_THREAD();
+
+    R_PushCmd((struct rcmd){
+        .func = R_GL_PipelineStatsEnd,
+        .nargs = 0
+    });
+
+    for(khiter_t k = kh_begin(s_thread_state_table); k != kh_end(s_thread_state_table); k++) {
+
+        if(!kh_exist(s_thread_state_table, k))
+            continue;
+
+        /* A non-empty stack means the owning thread is mid-function;
+         * advancing perf_tree_idx would invalidate the stack's indices. */
+        struct perf_state *curr = &kh_val(s_thread_state_table, k);
+        if(vec_size(&curr->perf_stack) > 0)
+            continue;
+
+        curr->perf_tree_idx = (curr->perf_tree_idx + 1) % NFRAMES_LOGGED;
+        vec_perf_reset(&curr->perf_trees[curr->perf_tree_idx]);
+        curr->last_read_size[curr->perf_tree_idx] = 0;
+    }
+
+    gather_mem_stats(&s_last_frames_memstats[s_last_idx]);
+    Mem_GetAccounting(&s_last_frames_accounting[s_last_idx]);
+    uint64_t prev_allocd = s_last_frames_allocd_bytes[positive_modulo(s_last_idx - 1, NFRAMES_LOGGED)];
+    uint64_t curr_allocd = (uint64_t)s_last_frames_memstats[s_last_idx].mi_malloc_normal_total;
+    s_last_frames_allocd_bytes[s_last_idx] = curr_allocd;
+
+    uint32_t curr_time = SDL_GetTicks();
+    uint32_t last_ts = s_last_frames_ms[s_last_idx];
+    s_last_frames_ms[s_last_idx] = curr_time - last_ts;
+
+    s_frame_time_hist[s_frame_time_head] = (struct frame_time_sample){
+        s_frame_time_seq++, s_last_frames_ms[s_last_idx]
+    };
+    s_frame_time_head = (s_frame_time_head + 1) % PERF_FRAME_HISTORY;
+    if(s_frame_time_count < PERF_FRAME_HISTORY)
+        s_frame_time_count++;
+
+    struct sval csv_setting;
+    if(Settings_Get("pf.debug.log_perf_csv", &csv_setting) == SS_OKAY
+    && csv_setting.as_bool) {
+        fprintf(stdout, "[frame-csv] %u,%u,%u\n",
+            s_frame_time_seq - 1, s_last_frames_ms[s_last_idx], SDL_GetTicks());
+    }
+
+    s_last_idx = (s_last_idx + 1) % NFRAMES_LOGGED;
+
+    struct sval log_setting;
+    if(Settings_Get("pf.debug.log_call_graphs", &log_setting) == SS_OKAY
+    && log_setting.as_bool) {
+        /* Dump only slow frames, rate-limited. Perf_LastFrameMS refers to the
+         * same aged slot whose tree Perf_Report reads.
+         */
+        static unsigned s_frames_since_dump = LOG_FREQUENCY;
+        s_frames_since_dump++;
+        struct sval min_setting;
+        int min_ms = (Settings_Get("pf.debug.call_graph_min_ms", &min_setting) == SS_OKAY)
+                   ? min_setting.as_int : SLOW_FRAME_DUMP_MS;
+        if(Perf_LastFrameMS() >= min_ms
+        && s_frames_since_dump >= LOG_FREQUENCY) {
+            s_frames_since_dump = 0;
+            struct perf_info *infos[32];
+            size_t nthreads = Perf_Report(sizeof(infos)/sizeof(infos[0]), infos);
+            perf_log_call_graph(nthreads, infos);
+            for(size_t i = 0; i < nthreads; i++)
+                PF_FREE(infos[i]);
+        }
+    }
+
+    if(Settings_Get("pf.debug.log_mem_stats", &log_setting) == SS_OKAY
+    && log_setting.as_bool) {
+        static unsigned s_mem_stats_counter = 0;
+        if((s_mem_stats_counter++ % LOG_FREQUENCY) == 0) {
+            perf_log_mem_stats();
+        }
+    }
+}
+
+size_t Perf_Report(size_t maxout, struct perf_info **out)
+{
+    size_t ret = 0;
+    for(khiter_t k = kh_begin(s_thread_state_table); k != kh_end(s_thread_state_table); k++) {
+    
+        if(!kh_exist(s_thread_state_table, k))
+            continue;
+        if(ret == maxout)
+            break;
+
+        struct perf_state *ps = &kh_val(s_thread_state_table, k);
+        int read_idx = (ps->perf_tree_idx + 1) % NFRAMES_LOGGED;
+        struct perf_info *info = PF_MALLOC(sizeof(struct perf_info) + vec_size(&ps->perf_trees[read_idx]) * sizeof(info->entries[0]));
+        if(!info)
+            break;
+
+        pf_strlcpy(info->threadname, ps->name, sizeof(info->threadname));
+        info->nentries = vec_size(&ps->perf_trees[read_idx]);
+
+        for(int i = 0; i < vec_size(&ps->perf_trees[read_idx]); i++) {
+
+            const struct perf_entry *entry = &vec_AT(&ps->perf_trees[read_idx], i);
+
+            if(k == kh_get(pstate, s_thread_state_table, GPU_STATE_KEY)) {
+                uint64_t hz = GPU_TIMER_HZ;
+                uint64_t delta = abs(entry->end.gpu_ts - entry->begin.gpu_ts);
+                info->entries[i].pc_delta = delta;
+                info->entries[i].ms_delta = (delta * 1000.0 / hz);
+            }else{
+                uint64_t hz = SDL_GetPerformanceFrequency();
+                info->entries[i].pc_delta = entry->pc_delta;
+                info->entries[i].ms_delta = (entry->pc_delta * 1000.0 / hz);
+            }
+
+            info->entries[i].funcname = name_for_id(ps, entry->name_id);
+            info->entries[i].parent_idx = entry->parent_idx;
+
+#if defined(__linux__) && !defined(NDEBUG)
+            uint64_t cyc = entry->hw_counters[PE_CYCLES];
+            uint64_t ins = entry->hw_counters[PE_INSTR];
+            uint64_t br  = entry->hw_counters[PE_BRANCH];
+            uint64_t brm = entry->hw_counters[PE_BRANCH_MISS];
+            uint64_t l1r = entry->hw_counters[PE_L1D_REF];
+            uint64_t l1m = entry->hw_counters[PE_L1D_MISS];
+            uint64_t llr = entry->hw_counters[PE_LLC_REF];
+            uint64_t llm = entry->hw_counters[PE_LLC_MISS];
+            info->entries[i].hw_ipc      = cyc ? (float)ins / cyc        : 0.0f;
+            info->entries[i].hw_br_miss  = br  ? 100.0f * brm / br       : 0.0f;
+            info->entries[i].hw_l1d_miss = l1r ? 100.0f * l1m / l1r      : 0.0f;
+            info->entries[i].hw_llc_miss = llr ? 100.0f * llm / llr      : 0.0f;
+#else
+            info->entries[i].hw_ipc      = 0.0f;
+            info->entries[i].hw_br_miss  = 0.0f;
+            info->entries[i].hw_l1d_miss = 0.0f;
+            info->entries[i].hw_llc_miss = 0.0f;
+#endif
+        }
+        out[ret++] = info;
+    }
+
+    return ret;
+}
+
+void Perf_GetMemoryStats(struct perf_mem_stats *out)
+{
+#ifdef NDEBUG
+    memset(out, 0, sizeof(*out));
+    return;
+#else
+    int read_idx = (s_last_idx + 1) % NFRAMES_LOGGED;
+    *out = s_last_frames_memstats[read_idx];
+#endif
+}
+
+void Perf_GetVramStats(struct vram_stats *out)
+{
+    int read_idx = (s_last_idx + 1) % NFRAMES_LOGGED;
+    *out = s_vram[read_idx];
+}
+
+void Perf_GetGpuFrameStats(struct gpu_frame_stats *out)
+{
+    int read_idx = (s_last_idx + 1) % NFRAMES_LOGGED;
+    *out = s_gpu_frame_stats[read_idx];
+}
+
+void Perf_RecordBillboardStats(const struct billboard_frame_stats *stats)
+{
+    ASSERT_IN_MAIN_THREAD();
+    s_bill_stats[s_last_idx] = *stats;
+}
+
+void Perf_GetBillboardStats(struct billboard_frame_stats *out)
+{
+    int read_idx = (s_last_idx + 1) % NFRAMES_LOGGED;
+    *out = s_bill_stats[read_idx];
+}
+
+void Perf_RecordNavTick(const struct nav_tick_sample *sample)
+{
+    ASSERT_IN_MAIN_THREAD();
+    s_nav_tick_hist[s_nav_tick_head] = *sample;
+    s_nav_tick_hist[s_nav_tick_head].tick = s_nav_tick_seq++;
+
+    struct sval csv_setting;
+    if(Settings_Get("pf.debug.log_perf_csv", &csv_setting) == SS_OKAY
+    && csv_setting.as_bool) {
+        const struct nav_tick_sample *r = &s_nav_tick_hist[s_nav_tick_head];
+        fprintf(stdout, "[nav-csv] %u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,"
+            "%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,"
+            "%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,"
+            "%u,%u,%u,%u,%u,%u,%u,%u\n",
+            r->dur_us, r->serial_us, r->total_us, r->nwork, r->budget_us, r->tick,
+            r->inval_us, r->los_peek_us, r->los_build_us, r->cpr_async_us,
+            r->cpr_serial_us, r->dv_us, r->vel_us, r->upd_us, r->main_us,
+            r->consume_us, r->copy_gs_us, r->submit_us, r->map_update_us,
+            r->drain_us, r->pivot_us, r->cmds_us, r->flock_us, r->snaps_us,
+            r->nlos_builds, r->nreq_rebuilds, r->nenemy_built, r->nzone_built,
+            r->nsurround_built, r->ninval_enemy, r->ninval_surround,
+            r->nsvc_sync, r->nsvc_patch, r->nastar, r->nastar_memo,
+            r->npseek_built, r->ncp_zero, r->ncp_retry_ok, r->ncp_stalled,
+            r->nseek_vdes0, r->nheading_gated, r->nstate_moving,
+            r->nstate_arrived, r->nstate_seek, r->nstate_waiting,
+            r->nstate_turning, r->period_us, r->fiber_frames, r->nlate,
+            r->nfield_tasks, r->field_us_sum, r->field_us_max, r->field_wall_us,
+            r->nchain_tasks, r->chain_us_sum, r->chain_us_max, r->chain_wall_us,
+            r->ncarried, r->carry_join_us, r->astar_us, r->los_record_us,
+            r->los_ensure_us, r->nlos_flagged, r->req_prep_us,
+            r->inline_flood_us, r->ninline_flood, r->req_total_us, r->nreq, r->req_walk_us);
+    }
+
+    s_nav_tick_head = (s_nav_tick_head + 1) % PERF_NAV_TICK_HISTORY;
+    if(s_nav_tick_count < PERF_NAV_TICK_HISTORY)
+        s_nav_tick_count++;
+}
+
+void Perf_NavParallelReset(void)
+{
+    SDL_AtomicSet(&s_nav_parallel_us, 0);
+}
+
+void Perf_NavParallelAddSince(uint64_t start_ticks)
+{
+    uint64_t freq = SDL_GetPerformanceFrequency();
+    uint64_t us = freq ? (SDL_GetPerformanceCounter() - start_ticks) * 1000000ull / freq : 0;
+    SDL_AtomicAdd(&s_nav_parallel_us, (int)us);
+}
+
+uint32_t Perf_NavParallelGet(void)
+{
+    return (uint32_t)SDL_AtomicGet(&s_nav_parallel_us);
+}
+
+size_t Perf_GetNavTickTimes(size_t maxout, struct nav_tick_sample *out)
+{
+    ASSERT_IN_MAIN_THREAD();
+    size_t n = (maxout < s_nav_tick_count) ? maxout : s_nav_tick_count;
+    size_t start = (s_nav_tick_head + PERF_NAV_TICK_HISTORY - n) % PERF_NAV_TICK_HISTORY;
+    for(size_t i = 0; i < n; i++)
+        out[i] = s_nav_tick_hist[(start + i) % PERF_NAV_TICK_HISTORY];
+    return n;
+}
+
+size_t Perf_GetFrameTimes(size_t maxout, struct frame_time_sample *out)
+{
+    ASSERT_IN_MAIN_THREAD();
+    size_t n = (maxout < s_frame_time_count) ? maxout : s_frame_time_count;
+    size_t start = (s_frame_time_head + PERF_FRAME_HISTORY - n) % PERF_FRAME_HISTORY;
+    for(size_t i = 0; i < n; i++)
+        out[i] = s_frame_time_hist[(start + i) % PERF_FRAME_HISTORY];
+    return n;
+}
+
+void Perf_GetMemoryAccounting(struct mem_accounting *out)
+{
+    int read_idx = (s_last_idx + 1) % NFRAMES_LOGGED;
+    *out = s_last_frames_accounting[read_idx];
+}
+
+void Perf_GetGpuMemoryAccounting(struct gpu_mem_accounting *out)
+{
+    int read_idx = (s_last_idx + 1) % NFRAMES_LOGGED;
+    *out = s_gpu_accounting[read_idx];
+}
+
+uint32_t Perf_LastFrameMS(void)
+{
+    int read_idx = (s_last_idx + 1) % NFRAMES_LOGGED;
+    return s_last_frames_ms[read_idx];
+}
+
+uint64_t Perf_FrameStartTicks(void)
+{
+    return s_frame_start_pc;
+}
+
+uint32_t Perf_CurrFrameMS(void)
+{
+    uint32_t curr_time = SDL_GetTicks();
+    uint32_t last_ts = s_last_frames_ms[s_last_idx];
+    return curr_time - last_ts;
+}
+
+uint64_t Perf_LastFrameAllocdBytes(void)
+{
+#ifdef NDEBUG
+    return 0;
+#else
+    int read_idx_prev = positive_modulo(s_last_idx - 2, NFRAMES_LOGGED);
+    int read_idx_curr = positive_modulo(s_last_idx - 1, NFRAMES_LOGGED);
+    return s_last_frames_allocd_bytes[read_idx_curr]
+         - s_last_frames_allocd_bytes[read_idx_prev];
+#endif
+}
+

@@ -1,0 +1,2 @@
+Upstream URL: https://github.com/eduard-permyakov/permafrost-engine.git
+Pinned revision: 083a99cace3eb047e7a3ccb7dc6b22eb78e3967f

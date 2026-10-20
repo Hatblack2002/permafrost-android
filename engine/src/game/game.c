@@ -1,0 +1,4485 @@
+/*
+ *  This file is part of Permafrost Engine. 
+ *  Copyright (C) 2017-2026 Eduard Permyakov 
+ *
+ *  Permafrost Engine is free software: you can redistribute it and/or modify
+ *  it under the terms of the GNU General Public License as published by
+ *  the Free Software Foundation, either version 3 of the License, or
+ *  (at your option) any later version.
+ *
+ *  Permafrost Engine is distributed in the hope that it will be useful,
+ *  but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *  GNU General Public License for more details.
+ *
+ *  You should have received a copy of the GNU General Public License
+ *  along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ * 
+ *  Linking this software statically or dynamically with other modules is making 
+ *  a combined work based on this software. Thus, the terms and conditions of 
+ *  the GNU General Public License cover the whole combination. 
+ *  
+ *  As a special exception, the copyright holders of Permafrost Engine give 
+ *  you permission to link Permafrost Engine with independent modules to produce 
+ *  an executable, regardless of the license terms of these independent 
+ *  modules, and to copy and distribute the resulting executable under 
+ *  terms of your choice, provided that you also meet, for each linked 
+ *  independent module, the terms and conditions of the license of that 
+ *  module. An independent module is a module which is not derived from 
+ *  or based on Permafrost Engine. If you modify Permafrost Engine, you may 
+ *  extend this exception to your version of Permafrost Engine, but you are not 
+ *  obliged to do so. If you do not wish to do so, delete this exception 
+ *  statement from your version.
+ *
+ */
+
+#define MEM_FILE_SYS MEM_SYS_GAME
+#define MEM_FILE_SUB MEM_SUB_GAME_DISPATCH
+
+#include "public/game.h"
+#include "gamestate.h"
+#include "selection.h"
+#include "timer_events.h"
+#include "movement.h"
+#include "formation.h"
+#include "game_private.h"
+#include "combat.h" 
+#include "clearpath.h"
+#include "position.h"
+#include "fog_of_war.h"
+#include "building.h"
+#include "builder.h"
+#include "harvester.h"
+#include "storage_site.h"
+#include "resource.h"
+#include "region.h"
+#include "garrison.h"
+#include "automation.h"
+#include "group.h"
+#include "population.h"
+#include "../render/public/render.h"
+#include "../render/public/render_ctrl.h"
+#include "../anim/public/anim.h"
+#include "../map/public/map.h"
+#include "../map/public/tile.h"
+#include "../audio/public/audio.h"
+#include "../phys/public/phys.h"
+#include "../phys/public/collision.h"
+#include "../lib/public/pf_string.h"
+#include "../mem.h"
+#include "../lib/public/pf_nuklear.h"
+#include "../entity.h"
+#include "../camera.h"
+#include "../cam_control.h"
+#include "../asset_load.h"
+#include "../event.h"
+#include "../config.h"
+#include "../settings.h"
+#include "../main.h"
+#include "../ui.h"
+#include "../perf.h"
+#include "../cursor.h"
+#include "../sched.h"
+#include "../sprite.h"
+
+#include <assert.h> 
+
+#undef PF_MALLOC
+#undef PF_CALLOC
+#undef PF_REALLOC
+#define PF_MALLOC(_n)       PF_MALLOC_TAGGED((_n), MEM_SYS_GAME, MEM_SUB_GAME_DISPATCH)
+#define PF_CALLOC(_c, _n)   PF_CALLOC_TAGGED((_c), (_n), MEM_SYS_GAME, MEM_SUB_GAME_DISPATCH)
+#define PF_REALLOC(_p, _n)  PF_REALLOC_TAGGED((_p), (_n), MEM_SYS_GAME, MEM_SUB_GAME_DISPATCH)
+
+
+/* Camera tilt is the angle (in degrees) the RTS camera is pitched up from
+ * looking straight down; the camera pitch is -(90 - tilt). Driven by the
+ * pf.game.camera_tilt setting. */
+#define CAM_TILT_MIN_DEGREES     15
+#define CAM_TILT_MAX_DEGREES     45
+#define CAM_TILT_DEFAULT_DEGREES 25
+#define CAM_SPEED           0.20f
+#define CAM_SENS            0.05f
+#define MAX_VIS_RANGE       150.0f
+
+#define MIN(a, b)           ((a) < (b) ? (a) : (b))
+#define MAX(a, b)           ((a) > (b) ? (a) : (b))
+#define ARR_SIZE(a)         (sizeof(a)/sizeof(a[0]))
+#define EPSILON             (1.0f/1024)
+
+#define CHK_TRUE_RET(_pred)   \
+    do{                       \
+        if(!(_pred))          \
+            return false;     \
+    }while(0)
+
+VEC_IMPL(extern, obb, struct obb)
+VEC_IMPL(extern, drawcand, struct draw_cand)
+__KHASH_IMPL(entity,  extern, khint32_t, uint32_t, 0, kh_int_hash_func, kh_int_hash_equal)
+__KHASH_IMPL(id,      extern, khint32_t, int,      1, kh_int_hash_func, kh_int_hash_equal)
+__KHASH_IMPL(range,   extern, khint32_t, float,    1, kh_int_hash_func, kh_int_hash_equal)
+
+/*****************************************************************************/
+/* STATIC VARIABLES                                                          */
+/*****************************************************************************/
+
+static struct gamestate s_gs;
+static int              s_last_ncands;
+static int              s_last_ndraw;
+/* Per-frame stage times (us): fog, anim, cull, drawlist, map+ents, healthbars, minimap */
+static uint32_t         s_stage_us[7];
+
+static inline uint32_t stage_us(uint64_t since)
+{
+    return (SDL_GetPerformanceCounter() - since) * 1000000 / SDL_GetPerformanceFrequency();
+}
+/* One ring at a time: it only ever answers "how far does this reach?" for the
+ * ability the pointer is currently on.
+ */
+static struct{
+    bool     active;
+    uint32_t uid;
+    float    radius;
+    float    width;
+    vec3_t   color;
+}s_range_indicator;
+
+/*****************************************************************************/
+/* STATIC FUNCTIONS                                                          */
+/*****************************************************************************/
+
+static vec2_t g_default_minimap_pos(void)
+{
+    struct sval res = (struct sval){ 
+        .type = ST_TYPE_VEC2, 
+        .as_vec2 = (vec2_t){1920, 1080}
+    };
+    const float PAD = 10.0f;
+    int size = 256;
+    
+    return (vec2_t) {
+        (size + 2*MINIMAP_BORDER_WIDTH) / cos(M_PI/4.0f)/2 + PAD,
+        res.as_vec2.y - (size + 2*MINIMAP_BORDER_WIDTH) / cos(M_PI/4.0f)/2 - PAD,
+    };
+}
+
+static void g_reset_camera(struct camera *cam)
+{
+    ss_e status;
+    (void)status;
+    struct sval setting;
+    status = Settings_Get("pf.game.default_camera_zoom", &setting);
+    assert(status == SS_OKAY);
+    float multiplier = setting.as_int / 100.0f;
+
+    struct sval tilt;
+    status = Settings_Get("pf.game.camera_tilt", &tilt);
+    assert(status == SS_OKAY);
+
+    Camera_SetPitchAndYaw(cam, -(90.0f - tilt.as_int), CONFIG_RTS_CAMERA_YAW_DEG);
+    Camera_SetPos(cam, (vec3_t){ 0.0f, BASE_CAM_HEIGHT * multiplier, 0.0f });
+}
+
+static bool g_init_camera(void) 
+{
+    s_gs.active_cam = Camera_New();
+    if(!s_gs.active_cam) {
+        return false;
+    }
+
+    struct sval proj;
+    if(Settings_Get("pf.game.camera_projection", &proj) == SS_OKAY) {
+        Camera_SetProjection(s_gs.active_cam, proj.as_int);
+    }
+
+    Camera_SetSpeed(s_gs.active_cam, CAM_SPEED);
+    Camera_SetSens (s_gs.active_cam, CAM_SENS);
+    g_reset_camera (s_gs.active_cam);
+    return true;
+}
+
+static void g_init_map(void)
+{
+    M_CenterAtOrigin(s_gs.map);
+    M_RestrictRTSCamToMap(s_gs.map, s_gs.active_cam);
+    M_Raycast_Install(s_gs.map, s_gs.active_cam);
+    M_InitMinimap(s_gs.map, g_default_minimap_pos());
+    M_FoliageInit(s_gs.map);
+    M_AL_InitTileUpdateBuffer(s_gs.map);
+    M_TerrainBake_Init(s_gs.map);
+    G_Pos_Init(s_gs.map);
+    G_Building_Init(s_gs.map);
+    G_Garrison_Init(s_gs.map);
+    G_Fog_Init(s_gs.map);
+    G_Combat_Init(s_gs.map);
+    G_Move_Init(s_gs.map);
+    G_Formation_Init(s_gs.map);
+    G_Builder_Init(s_gs.map);
+    G_Resource_Init(s_gs.map);
+    G_Region_Init(s_gs.map);
+    G_Harvester_Init(s_gs.map);
+    G_Automation_Init();
+    G_Group_Init();
+    G_ClearPath_Init(s_gs.map);
+    N_ClearState();
+}
+
+static void g_shadow_pass(struct render_input *in)
+{
+    R_PushCmd((struct rcmd){
+        .func = R_GL_DepthPassBegin,
+        .nargs = 2,
+        .args = {
+            R_PushArg(&in->light_pos, sizeof(in->light_pos)),
+            R_PushArg((void*)in->cam, g_sizeof_camera),
+        },
+    });
+
+    if(in->map) {
+        M_RenderVisibleMap(in->map, in->cam, true, RENDER_PASS_DEPTH, false, NULL);
+    }
+
+    if(s_gs.use_batch_rendering) {
+
+        R_PushCmd((struct rcmd){
+            .func = R_GL_Batch_RenderDepthMap,
+            .nargs = 1,
+            .args = { in }
+        });
+
+    }else{
+        for(int i = 0; i < vec_size(&in->light_vis_anim); i++) {
+        
+            struct ent_anim_rstate *curr = &vec_AT(&in->light_vis_anim, i);
+
+            mat4x4_t model, normal;
+            PFM_Mat4x4_Inverse(&curr->model, &model);
+            PFM_Mat4x4_Transpose(&model, &normal);
+
+            R_PushCmd((struct rcmd){
+                .func = R_GL_AnimSetUniforms,
+                .nargs = 2,
+                .args = {
+                    R_PushArg(&normal, sizeof(normal)),
+                    R_PushArg(&curr->desc, sizeof(curr->desc)),
+                },
+            });
+
+            R_PushCmd((struct rcmd){
+                .func = R_GL_RenderDepthMap,
+                .nargs = 2,
+                .args = {
+                    curr->render_private,
+                    R_PushArg(&curr->model, sizeof(curr->model)),
+                },
+            });
+        }
+
+        for(int i = 0; i < vec_size(&in->light_vis_stat); i++) {
+        
+            struct ent_stat_rstate *curr = &vec_AT(&in->light_vis_stat, i);
+            R_PushCmd((struct rcmd){
+                .func = R_GL_RenderDepthMap,
+                .nargs = 2,
+                .args = {
+                    curr->render_private,
+                    R_PushArg(&curr->model, sizeof(curr->model)),
+                },
+            });
+        }
+    }
+
+    if(vec_size(&in->light_vis_bill)) {
+        R_PushCmd((struct rcmd){
+            .func = R_GL_Billboard_DrawDepth,
+            .nargs = 1,
+            .args = { in },
+        });
+    }
+
+    R_PushCmd((struct rcmd){ R_GL_DepthPassEnd, 0 });
+}
+
+static void g_draw_pass(struct render_input *in)
+{
+    if(in->map) {
+        M_RenderVisibleMap(in->map, in->cam, in->shadows, RENDER_PASS_REGULAR, in->water_only,
+            in->terrain_layers);
+    }
+
+    if(s_gs.use_batch_rendering) {
+
+        R_PushCmd((struct rcmd){
+            .func = R_GL_Batch_Draw,
+            .nargs = 1,
+            .args = { in }
+        });
+
+    }else{
+        for(int i = 0; i < vec_size(&in->cam_vis_anim); i++) {
+        
+            struct ent_anim_rstate *curr = &vec_AT(&in->cam_vis_anim, i);
+
+            mat4x4_t model, normal;
+            PFM_Mat4x4_Inverse(&curr->model, &model);
+            PFM_Mat4x4_Transpose(&model, &normal);
+
+            R_PushCmd((struct rcmd){
+                .func = R_GL_AnimSetUniforms,
+                .nargs = 2,
+                .args = {
+                    R_PushArg(&normal, sizeof(normal)),
+                    R_PushArg(&curr->desc, sizeof(curr->desc)),
+                },
+            });
+
+            R_PushCmd((struct rcmd){
+                .func = R_GL_Draw,
+                .nargs = 3,
+                .args = {
+                    curr->render_private,
+                    R_PushArg(&curr->model, sizeof(curr->model)),
+                    R_PushArg(&curr->translucent, sizeof(curr->translucent)),
+                },
+            });
+        }
+
+        for(int i = 0; i < vec_size(&in->cam_vis_stat); i++) {
+        
+            struct ent_stat_rstate *curr = &vec_AT(&in->cam_vis_stat, i);
+            R_PushCmd((struct rcmd){
+                .func = R_GL_Draw,
+                .nargs = 3,
+                .args = {
+                    curr->render_private,
+                    R_PushArg(&curr->model, sizeof(curr->model)),
+                    R_PushArg(&curr->translucent, sizeof(curr->translucent)),
+                },
+            });
+        }
+    }
+
+    /* The billboard pass is a single self-contained instanced draw, used
+     * regardless of the batching mode. The water passes skip it.
+     */
+    if(!in->water_only && vec_size(&in->cam_vis_bill)) {
+        R_PushCmd((struct rcmd){
+            .func = R_GL_Billboard_Draw,
+            .nargs = 1,
+            .args = { in },
+        });
+    }
+}
+
+static void g_render_healthbars(void)
+{
+    PERF_ENTER();
+
+    struct sval hb_setting;
+    ss_e status = Settings_Get("pf.game.healthbar_mode", &hb_setting);
+    assert(status == SS_OKAY);
+    (void)status;
+
+    if(hb_setting.as_int == HB_MODE_NEVER)
+        PERF_RETURN_VOID();
+
+    size_t max_ents = vec_size(&s_gs.visible);
+    size_t num_combat_visible = 0;
+
+    STALLOC(GLfloat, ent_health_pc, max_ents);
+    STALLOC(vec3_t, ent_top_pos_ws, max_ents);
+    STALLOC(int, ent_yoffsets, max_ents);
+
+    for(int i = 0; i < max_ents; i++) {
+
+        uint32_t curr = vec_AT(&s_gs.visible, i);
+        uint32_t flags = G_FlagsGet(curr);
+
+        if(!(flags & ENTITY_FLAG_COMBATABLE))
+            continue;
+        if((flags & ENTITY_FLAG_BUILDING) && !G_Building_IsFounded(curr))
+            continue;
+        if(flags & ENTITY_FLAG_GARRISONED)
+            continue;
+        if(flags & ENTITY_FLAG_ZOMBIE)
+            continue;
+
+        int curr_health = 0, max_health = 0;
+        G_Combat_GetHPDisplay(curr, &curr_health, &max_health);
+
+        if(curr_health == 0 || max_health == 0)
+            continue;
+        if(hb_setting.as_int == HB_MODE_DAMAGED && curr_health == max_health)
+            continue;
+
+        int yoffset = -20;
+        if((flags & ENTITY_FLAG_STORAGE_SITE) && G_StorageSite_GetShowUI()) {
+            yoffset += G_StorageSite_GetWindowHeight(curr) / 8.0f;
+        }
+
+        ent_top_pos_ws[num_combat_visible] = Entity_TopCenterPointWS(curr);
+        ent_health_pc[num_combat_visible] = ((GLfloat)curr_health)/max_health;
+        ent_yoffsets[num_combat_visible] = yoffset;
+
+        num_combat_visible++;
+    }
+
+    R_PushCmd((struct rcmd){
+        .func = R_GL_DrawHealthbars,
+        .nargs = 5,
+        .args = {
+            R_PushArg(&num_combat_visible, sizeof(num_combat_visible)),
+            R_PushArg(ent_health_pc, max_ents * sizeof(GLfloat)),
+            R_PushArg(ent_top_pos_ws, max_ents * sizeof(vec3_t)),
+            R_PushArg(ent_yoffsets, max_ents * sizeof(int)),
+            R_PushArg(s_gs.active_cam, g_sizeof_camera),
+        },
+    });
+
+    STFREE(ent_health_pc);
+    STFREE(ent_top_pos_ws);
+    STFREE(ent_yoffsets);
+
+    PERF_RETURN_VOID();
+}
+
+/* Stable opaque-before-translucent partition; the insertion-sort variant was
+ * quadratic when translucent entries appeared early in the list.
+ */
+static void g_sort_stat_list(vec_rstat_t *inout)
+{
+    PERF_ENTER();
+    size_t n = vec_size(inout);
+    if(n == 0)
+        PERF_RETURN_VOID();
+
+    struct ent_stat_rstate *scratch = stalloc(&G_GetSimWS()->args,
+        n * sizeof(*scratch));
+    size_t head = 0;
+    for(size_t i = 0; i < n; i++) {
+        if(!vec_AT(inout, i).translucent)
+            scratch[head++] = vec_AT(inout, i);
+    }
+    for(size_t i = 0; i < n; i++) {
+        if(vec_AT(inout, i).translucent)
+            scratch[head++] = vec_AT(inout, i);
+    }
+    memcpy(inout->array, scratch, n * sizeof(*scratch));
+    PERF_RETURN_VOID();
+}
+
+static void g_sort_anim_list(vec_ranim_t *inout)
+{
+    PERF_ENTER();
+    size_t n = vec_size(inout);
+    if(n == 0)
+        PERF_RETURN_VOID();
+
+    struct ent_anim_rstate *scratch = stalloc(&G_GetSimWS()->args,
+        n * sizeof(*scratch));
+    size_t head = 0;
+    for(size_t i = 0; i < n; i++) {
+        if(!vec_AT(inout, i).translucent)
+            scratch[head++] = vec_AT(inout, i);
+    }
+    for(size_t i = 0; i < n; i++) {
+        if(vec_AT(inout, i).translucent)
+            scratch[head++] = vec_AT(inout, i);
+    }
+    memcpy(inout->array, scratch, n * sizeof(*scratch));
+    PERF_RETURN_VOID();
+}
+
+static int bb_desc_cmp(const void *a, const void *b)
+{
+    const struct ent_bill_rstate *ra = a, *rb = b;
+    if(ra->desc == rb->desc)
+        return 0;
+    return (ra->desc < rb->desc) ? -1 : 1;
+}
+
+/* Group the billboard list by descriptor so the render thread can 
+ * issue one instanced draw per model.
+ */
+static void g_sort_bill_list(vec_rbill_t *inout)
+{
+    PERF_ENTER();
+    qsort(inout->array, vec_size(inout), sizeof(struct ent_bill_rstate), bb_desc_cmp);
+    PERF_RETURN_VOID();
+}
+
+/* Cliff tiles dress the terrain faces from below the surface; 
+ * a centre-anchored billboard for them sinks into the terrain 
+ * and loses every depth test.
+ */
+static bool g_billboard_excluded(const struct entity *ent)
+{
+    return ent->name
+        && (ent->name[0] == '_')
+        && (strcmp(ent->name, "__tile__") == 0);
+}
+
+static int g_select_lod(float dist, float d1, float d2)
+{
+    if(dist >= d2)
+        return 2;
+    if(dist >= d1)
+        return 1;
+    return 0;
+}
+
+static void *g_lod_priv(const struct entity *ent, int lod)
+{
+    if(lod <= 0)
+        return ent->render_private;
+    return ent->render_private_lod[lod - 1];
+}
+
+static void *g_lod_priv_coarsest(const struct entity *ent)
+{
+    if(ent->render_private_lod[1] != ent->render_private)
+        return ent->render_private_lod[1];
+    if(ent->render_private_lod[0] != ent->render_private)
+        return ent->render_private_lod[0];
+    return ent->render_private;
+}
+
+/* Both passes are built in a single sweep of the union: an entity drawn by the
+ * camera and by the light shares everything but its mesh LOD, so its flags,
+ * model matrix, pose descriptor and tile are resolved once.
+ */
+static void g_make_draw_lists(struct render_input *out)
+{
+    PERF_ENTER();
+    R_Billboard_Tick();
+
+    struct map_resolution res;
+    if(s_gs.map) {
+        M_GetResolution(s_gs.map, &res);
+    }
+
+    struct sval lod_setting;
+    bool lod_enabled = (Settings_Get("pf.video.lod_enabled", &lod_setting) == SS_OKAY)
+                     && lod_setting.as_bool;
+
+    float lod_d1 = 300.0f, lod_d2 = 450.0f;
+    if(Settings_Get("pf.video.lod_dist1", &lod_setting) == SS_OKAY)
+        lod_d1 = lod_setting.as_float;
+    if(Settings_Get("pf.video.lod_dist2", &lod_setting) == SS_OKAY)
+        lod_d2 = lod_setting.as_float;
+
+    struct sval bb_setting;
+    bool bb_enabled = (Settings_Get("pf.video.billboards_enabled", &bb_setting) == SS_OKAY)
+                    && bb_setting.as_bool;
+
+    float bb_dist = 340.0f;
+    if(Settings_Get("pf.video.billboard_dist", &bb_setting) == SS_OKAY)
+        bb_dist = bb_setting.as_float;
+
+    /* A camera pitched away from the RTS elevation the atlases are baked for
+     * shows sheared, mis-rotated cards; statics fall back to meshes there.
+     */
+    bool bb_pitch_ok = true;
+    if(bb_enabled && (Settings_Get("pf.game.camera_tilt", &bb_setting) == SS_OKAY)) {
+        float rts_pitch = -(90.0f - bb_setting.as_int);
+        bb_pitch_ok = fabsf(Camera_GetPitch(s_gs.active_cam) - rts_pitch)
+                   <= CONFIG_BILLBOARD_MAX_PITCH_DEV_DEG;
+    }
+
+    /* Under an orthographic projection the apparent size is set by the zoom
+     * alone, so billboarding gates uniformly on the camera height; under a
+     * perspective one it gates on the per-entity distance.
+     */
+    bool bb_ortho = (Camera_GetProjection(s_gs.active_cam) == CAM_PROJ_ORTHOGRAPHIC);
+    bool bb_zoomed_out = (Camera_GetHeight(s_gs.active_cam) >= bb_dist);
+
+    vec3_t campos = Camera_GetPos(s_gs.active_cam);
+    uint32_t ncam_drawn = 0;
+
+    for(int i = 0; i < vec_size(&s_gs.draw_cands); i++) {
+
+        struct draw_cand cand = vec_AT(&s_gs.draw_cands, i);
+        uint32_t curr = cand.uid;
+        uint32_t flags = G_FlagsGet(curr);
+
+        if(flags & ENTITY_FLAG_INVISIBLE)
+            continue;
+
+        if(flags & ENTITY_FLAG_GARRISONED)
+            continue;
+
+        uint32_t passes = cand.passes;
+        if(!(flags & ENTITY_FLAG_COLLISION))
+            passes &= ~DRAW_PASS_LIGHT;
+
+        if(!passes)
+            continue;
+
+        if(passes & DRAW_PASS_CAM)
+            ncam_drawn++;
+
+        const struct entity *ent = AL_EntityGet(curr);
+        mat4x4_t model;
+        Entity_ModelMatrix(curr, &model);
+
+        vec3_t epos = G_Pos_Get(curr);
+        vec3_t delta;
+        PFM_Vec3_Sub(&campos, &epos, &delta);
+        float cam_dist = PFM_Vec3_Len(&delta);
+
+        /* Far entities with a baked atlas render as billboards in both the
+         * camera and the shadow pass; the card replaces the mesh everywhere
+         */
+        if(bb_enabled
+        && (bb_pitch_ok || (flags & ENTITY_FLAG_ANIMATED))
+        && (bb_ortho ? bb_zoomed_out : (cam_dist >= bb_dist))
+        && !(flags & ENTITY_FLAG_TRANSLUCENT)
+        && !g_billboard_excluded(ent)) {
+
+            const struct bb_model_desc *bb = R_Billboard_Get(ent->render_private);
+            vec3_t scale;
+            vec2_t scale2;
+            if(bb) {
+                scale = Entity_GetScale(curr);
+                scale2 = (vec2_t){MAX(scale.x, scale.z), scale.y};
+            }
+            if(bb && R_Billboard_ScaleEligible(bb, scale2)) {
+
+                int cell = 0;
+                if(flags & ENTITY_FLAG_ANIMATED) {
+                    cell = R_Billboard_CellBase(bb, A_GetCurrClipIndex(curr),
+                        A_GetCurrFrameIndex(curr));
+                }
+
+                quat_t rot = Entity_GetRot(curr);
+                struct ent_bill_rstate rstate = (struct ent_bill_rstate){
+                    .uid = curr,
+                    .desc = bb,
+                    .pos = epos,
+                    .yaw = 2.0f * atan2f(rot.y, rot.w),
+                    .scale = scale2,
+                    .cell_base = cell,
+                };
+                if(passes & DRAW_PASS_CAM) {
+                    vec_rbill_push(&out->cam_vis_bill, rstate);
+                }
+                if(passes & DRAW_PASS_LIGHT) {
+                    vec_rbill_push(&out->light_vis_bill, rstate);
+                }
+                continue;
+            }
+        }
+
+        /* The shadow and water passes always draw the coarsest mesh; the main
+         * camera pass selects by distance. */
+        void *cam_priv = ent->render_private;
+        void *light_priv = ent->render_private;
+        if(lod_enabled) {
+            if(passes & DRAW_PASS_CAM) {
+                cam_priv = g_lod_priv(ent, g_select_lod(cam_dist, lod_d1, lod_d2));
+            }
+            if(passes & DRAW_PASS_LIGHT) {
+                light_priv = g_lod_priv_coarsest(ent);
+            }
+        }
+
+        if(flags & ENTITY_FLAG_ANIMATED) {
+
+            struct ent_anim_rstate rstate = (struct ent_anim_rstate){
+                .uid = curr,
+                .model = model,
+                .translucent = !!(flags & ENTITY_FLAG_TRANSLUCENT),
+            };
+            A_GetRenderState(curr, &rstate.desc);
+
+            if(passes & DRAW_PASS_CAM) {
+                rstate.render_private = cam_priv;
+                vec_ranim_push(&out->cam_vis_anim, rstate);
+            }
+            if(passes & DRAW_PASS_LIGHT) {
+                rstate.render_private = light_priv;
+                vec_ranim_push(&out->light_vis_anim, rstate);
+            }
+
+        }else{
+
+            struct tile_desc td = {0};
+            if(s_gs.map) {
+                M_Tile_DescForPoint2D(res, M_GetPos(s_gs.map), G_Pos_GetXZ(curr), &td);
+            }
+
+            struct ent_stat_rstate rstate = (struct ent_stat_rstate){
+                .uid = curr,
+                .model = model,
+                .translucent = !!(flags & ENTITY_FLAG_TRANSLUCENT),
+                .td = td
+            };
+
+            if(passes & DRAW_PASS_CAM) {
+                rstate.render_private = cam_priv;
+                vec_rstat_push(&out->cam_vis_stat, rstate);
+            }
+            if(passes & DRAW_PASS_LIGHT) {
+                rstate.render_private = light_priv;
+                vec_rstat_push(&out->light_vis_stat, rstate);
+            }
+        }
+    }
+
+    g_sort_stat_list(&out->cam_vis_stat);
+    g_sort_anim_list(&out->cam_vis_anim);
+    g_sort_bill_list(&out->cam_vis_bill);
+    g_sort_stat_list(&out->light_vis_stat);
+    g_sort_anim_list(&out->light_vis_anim);
+    g_sort_bill_list(&out->light_vis_bill);
+
+    Perf_RecordBillboardStats(&(struct billboard_frame_stats){
+        .nbillboard = vec_size(&out->cam_vis_bill),
+        .ntotal = ncam_drawn,
+    });
+    PERF_RETURN_VOID();
+}
+
+static void *stackmalloc(size_t size)
+{
+    return stalloc(&s_gs.render_data_stack, size);
+}
+
+static void *stackrealloc(void *ptr, size_t size)
+{
+    if(!ptr)
+        return stackmalloc(size);
+
+    /* We don't really want to be hitting this case */
+    void *ret = stackmalloc(size);
+    if(!ret)
+        return NULL;
+    memmove(ret, ptr, size / 2);
+    return ret;
+}
+
+static void stackfree(void *ptr)
+{
+    /* no-op */
+}
+
+static void g_create_render_input(struct render_input *out)
+{
+    PERF_ENTER();
+
+    struct sval shadows_setting;
+    ss_e status = Settings_Get("pf.video.shadows_enabled", &shadows_setting);
+    assert(status == SS_OKAY);
+
+    out->cam = s_gs.active_cam;
+    out->map = s_gs.prev_tick_map;
+    out->shadows = shadows_setting.as_bool;
+    out->water_only = false;
+    out->light_pos = s_gs.light_pos;
+    out->terrain_layers = NULL;
+
+    vec_rstat_init_alloc(&out->cam_vis_stat, stackrealloc, stackfree);
+    vec_ranim_init_alloc(&out->cam_vis_anim, stackrealloc, stackfree);
+    vec_rbill_init_alloc(&out->cam_vis_bill, stackrealloc, stackfree);
+
+    vec_rstat_init_alloc(&out->light_vis_stat, stackrealloc, stackfree);
+    vec_ranim_init_alloc(&out->light_vis_anim, stackrealloc, stackfree);
+    vec_rbill_init_alloc(&out->light_vis_bill, stackrealloc, stackfree);
+
+    vec_rstat_resize(&out->cam_vis_stat, 2048);
+    vec_ranim_resize(&out->cam_vis_anim, 2048);
+    vec_rbill_resize(&out->cam_vis_bill, 2048);
+
+    vec_rstat_resize(&out->light_vis_stat, 2048);
+    vec_ranim_resize(&out->light_vis_anim, 2048);
+    vec_rbill_resize(&out->light_vis_bill, 2048);
+
+    g_make_draw_lists(out);
+
+    PERF_RETURN_VOID();
+}
+
+static void g_destroy_render_input(void)
+{
+    stalloc_clear(&s_gs.render_data_stack);
+}
+
+static void *g_push_render_input(struct render_input in)
+{
+    struct render_input *ret = R_PushArg(&in, sizeof(in));
+
+    ret->cam = R_PushArg(in.cam, g_sizeof_camera);
+
+    if(in.cam_vis_stat.size) {
+        ret->cam_vis_stat.array = R_PushArg(in.cam_vis_stat.array, 
+            in.cam_vis_stat.size * sizeof(struct ent_stat_rstate));
+    }
+    if(in.cam_vis_anim.size) {
+        ret->cam_vis_anim.array = R_PushArg(in.cam_vis_anim.array, 
+            in.cam_vis_anim.size * sizeof(struct ent_anim_rstate));
+    }
+    if(in.cam_vis_bill.size) {
+        ret->cam_vis_bill.array = R_PushArg(in.cam_vis_bill.array,
+            in.cam_vis_bill.size * sizeof(struct ent_bill_rstate));
+    }
+
+    if(in.light_vis_stat.size) {
+        ret->light_vis_stat.array = R_PushArg(in.light_vis_stat.array, 
+            in.light_vis_stat.size * sizeof(struct ent_stat_rstate));
+    }
+    if(in.light_vis_anim.size) {
+        ret->light_vis_anim.array = R_PushArg(in.light_vis_anim.array,
+            in.light_vis_anim.size * sizeof(struct ent_anim_rstate));
+    }
+    if(in.light_vis_bill.size) {
+        ret->light_vis_bill.array = R_PushArg(in.light_vis_bill.array,
+            in.light_vis_bill.size * sizeof(struct ent_bill_rstate));
+    }
+
+    return ret;
+}
+
+static bool bool_val_validate(const struct sval *new_val)
+{
+    return (new_val->type == ST_TYPE_BOOL);
+}
+
+static bool float_val_validate(const struct sval *new_val)
+{
+    return (new_val->type == ST_TYPE_FLOAT);
+}
+
+static bool lod_dist_validate(const struct sval *new_val)
+{
+    return (new_val->type == ST_TYPE_FLOAT) && (new_val->as_float >= 0.0f);
+}
+
+static bool water_prune_radius_validate(const struct sval *new_val)
+{
+    return (new_val->type == ST_TYPE_INT)
+        && (new_val->as_int >= 0) && (new_val->as_int <= 64);
+}
+
+static bool cam_zoom_validate(const struct sval *new_val)
+{
+    if(new_val->type != ST_TYPE_INT)
+        return false;
+    if(new_val->as_int < 75 || new_val->as_int > 200)
+        return false;
+    return true;
+}
+
+static void cam_zoom_commit(const struct sval *new_val)
+{
+    float multiplier = new_val->as_int / 100.0f;
+    if(G_GetCameraMode() != CAM_MODE_RTS)
+        return;
+
+    struct camera *cam = G_GetActiveCamera();
+    vec3_t pos = Camera_GetPos(cam);
+    Camera_SetPos(cam, (vec3_t){ pos.x, BASE_CAM_HEIGHT * multiplier, pos.z }); 
+}
+
+static bool move_hz_validate(const struct sval *new_val)
+{
+    if(new_val->type != ST_TYPE_INT)
+        return false;
+
+    const int allowed[] = {1,5,10,20};
+    bool found = false;
+    for(int i = 0; i < ARR_SIZE(allowed); i++) {
+        if(allowed[i] == new_val->as_int) {
+            found = true;
+            break;
+        }
+    }
+    if(!found)
+        return false;
+
+    return true;
+}
+
+static void move_hz_commit(const struct sval *new_val)
+{
+    int mapping[] = {
+        [1] = MOVE_HZ_1,
+        [5] = MOVE_HZ_5,
+        [10] = MOVE_HZ_10,
+        [20] = MOVE_HZ_20,
+    };
+    int raw = new_val->as_int;
+    G_Move_SetTickHz(mapping[raw]);
+}
+
+static bool combat_hz_validate(const struct sval *new_val)
+{
+    if(new_val->type != ST_TYPE_FLOAT)
+        return false;
+
+    const float allowed[] = {0.5, 1.0, 5.0, 10.0};
+    bool found = false;
+    for(int i = 0; i < ARR_SIZE(allowed); i++) {
+        if(fabs(allowed[i] - new_val->as_float) < EPSILON) {
+            found = true;
+            break;
+        }
+    }
+    if(!found)
+        return false;
+
+    return true;
+}
+
+static void combat_hz_commit(const struct sval *new_val)
+{
+    enum combat_hz hz;
+
+    if(fabs(new_val->as_float - 0.5f) < EPSILON) {
+        hz = COMBAT_HZ_HALF;
+    }else if(fabs(new_val->as_float - 1.0f) < EPSILON) {
+        hz = COMBAT_HZ_1;
+    }else if(fabs(new_val->as_float - 5.0f) < EPSILON) {
+        hz = COMBAT_HZ_5;
+    }else{
+        hz = COMBAT_HZ_10;
+    }
+    G_Combat_SetTickHz(hz);
+}
+
+static void move_gpu_commit(const struct sval *new_val)
+{
+    bool next = new_val->as_bool;
+    if(!R_ComputeShaderSupported()) {
+        next = false;
+    }
+    G_Move_SetUseGPU(next);
+}
+
+static void perf_hw_counters_commit(const struct sval *new_val)
+{
+    Perf_SetHWCountersEnabled(new_val->as_bool);
+}
+
+static bool nav_layer_validate(const struct sval *new_val)
+{
+    if(new_val->type != ST_TYPE_INT)
+        return false;
+    if(new_val->as_int < 0 || new_val->as_int >= NAV_LAYER_MAX)
+        return false;
+    return true;
+}
+
+static bool int_validate(const struct sval *new_val)
+{
+    if(new_val->type != ST_TYPE_INT)
+        return false;
+    if(new_val->as_int < 0)
+        return false;
+    return true;
+}
+
+static bool hb_mode_validate(const struct sval *new_val)
+{
+    if(new_val->type != ST_TYPE_INT)
+        return false;
+    if(new_val->as_int < 0 || new_val->as_int > HB_MODE_NEVER)
+        return false;
+    return true;
+}
+
+static bool cam_projection_validate(const struct sval *new_val)
+{
+    if(new_val->type != ST_TYPE_INT)
+        return false;
+    return (new_val->as_int >= CAM_PROJ_PERSPECTIVE && new_val->as_int <= CAM_PROJ_ORTHOGRAPHIC);
+}
+
+static bool cam_tilt_validate(const struct sval *new_val)
+{
+    if(new_val->type != ST_TYPE_INT)
+        return false;
+    return (new_val->as_int >= CAM_TILT_MIN_DEGREES && new_val->as_int <= CAM_TILT_MAX_DEGREES);
+}
+
+static bool fac_vision_validate(const struct sval *new_val)
+{
+    if(new_val->type != ST_TYPE_INT)
+        return false;
+    return (new_val->as_int >= -1 && new_val->as_int <= MAX_FACTIONS);
+}
+
+static bool faction_id_validate(const struct sval *new_val)
+{
+    if(new_val->type != ST_TYPE_INT)
+        return false;
+    if(new_val->as_int < 0)
+        return false;
+    return true;
+}
+
+static void shadows_en_commit(const struct sval *new_val)
+{
+    if(!s_gs.active)
+        return;
+
+    R_PushCmd((struct rcmd){
+        .func = R_GL_SetShadowsEnabled,
+        .nargs = 1,
+        .args = {
+            R_PushArg(&new_val->as_bool, sizeof(bool)),
+        }
+    });
+}
+
+static bool terrain_bake_res_validate(const struct sval *new_val)
+{
+    if(new_val->type != ST_TYPE_INT)
+        return false;
+    return (new_val->as_int == 1024 || new_val->as_int == 2048 || new_val->as_int == 4096);
+}
+
+static void terrain_bake_commit(const struct sval *new_val)
+{
+    if(!s_gs.active)
+        return;
+
+    struct sval res, compress;
+    if(Settings_Get("pf.video.terrain_bake_res", &res) != SS_OKAY
+    || Settings_Get("pf.video.terrain_bake_compress", &compress) != SS_OKAY)
+        return;
+
+    M_TerrainBake_Reconfigure(res.as_int, compress.as_bool);
+}
+
+static void batching_en_commit(const struct sval *new_val)
+{
+    s_gs.use_batch_rendering = new_val->as_bool;
+}
+
+static void billboards_en_commit(const struct sval *new_val)
+{
+    if(new_val->as_bool) {
+        R_Billboard_EnsureAllBaked();
+    }
+}
+
+static bool g_save_anim_state(SDL_RWops *stream)
+{
+    size_t nanim = 0;
+
+    uint32_t curr;
+    kh_foreach_key(s_gs.active, curr, {
+
+        uint32_t flags = G_FlagsGet(curr);
+        if(!(flags & ENTITY_FLAG_ANIMATED))
+            continue;
+        if(flags & ENTITY_FLAG_MARKER)
+            continue;
+        nanim++;
+    });
+
+    struct attr num_anim = (struct attr){
+        .type = TYPE_INT, 
+        .val.as_int = nanim
+    };
+    CHK_TRUE_RET(Attr_Write(stream, &num_anim, "num_anim"));
+
+    kh_foreach_key(s_gs.active, curr, {
+
+        uint32_t flags = G_FlagsGet(curr);
+        if(!(flags & ENTITY_FLAG_ANIMATED))
+            continue;
+        if(flags & ENTITY_FLAG_MARKER)
+            continue;
+
+        struct attr uid = (struct attr){
+            .type = TYPE_INT,
+            .val.as_int = curr
+        };
+        CHK_TRUE_RET(Attr_Write(stream, &uid, "uid"));
+        CHK_TRUE_RET(A_SaveState(stream, curr));
+        Sched_TryYield();
+    });
+
+    return true;
+}
+
+static bool g_load_anim_state(SDL_RWops *stream)
+{
+    struct attr attr;
+
+    CHK_TRUE_RET(Attr_Parse(stream, &attr, true));
+    CHK_TRUE_RET(attr.type == TYPE_INT);
+    const size_t nanim = attr.val.as_int;
+
+    for(int i = 0; i < nanim; i++) {
+
+        uint32_t uid;
+        CHK_TRUE_RET(Attr_Parse(stream, &attr, true));
+        CHK_TRUE_RET(attr.type == TYPE_INT);
+        uid = attr.val.as_int;
+
+        CHK_TRUE_RET(G_EntityExists(uid));
+        CHK_TRUE_RET(A_LoadState(stream, uid));
+        Sched_TryYield();
+    }
+
+    return true;
+}
+
+static size_t g_num_factions(void)
+{
+    size_t ret = 0;
+    for(int i = 0; i < MAX_FACTIONS; i++) {
+        if(s_gs.factions_allocd & (0x1 << i))
+            ret++;
+    }
+    return ret;
+}
+
+static int g_alloc_faction(void)
+{
+    for(int i = 0; i < MAX_FACTIONS; i++) {
+        if(0 == (s_gs.factions_allocd & (0x1 << i))) {
+            s_gs.factions_allocd |= (0x1 << i);
+            return i;
+        }
+    }
+    return -1;
+}
+
+static uint16_t g_player_mask(void)
+{
+    bool controllable[MAX_FACTIONS];
+    uint16_t facs = G_GetFactions(NULL, NULL, controllable);
+
+    uint16_t ret = 0;
+    for(int i = 0; i < MAX_FACTIONS; i++) {
+        if(facs & (0x1 << i) && controllable[i])
+            ret |= (0x1 << i);
+    }
+    return ret;
+}
+
+/* Padding on the frustum footprint query, in world units: the culling test
+ * is on the entity's OBB, so one centred just outside the footprint can
+ * still reach into it. Larger than any entity's half-extent.
+ */
+#define CULL_QUERY_PAD (64.0f)
+
+/* XZ footprint of a frustum. A frustum is the convex hull of its 8 corners,
+ * so every point inside it lies within this box; an entity rejected against
+ * the box cannot be inside the frustum.
+ */
+static void g_frustum_xz_bounds(const struct frustum *f, vec2_t *out_min, vec2_t *out_max)
+{
+    const vec3_t *corners[8] = {
+        &f->ntl, &f->ntr, &f->nbl, &f->nbr,
+        &f->ftl, &f->ftr, &f->fbl, &f->fbr
+    };
+    *out_min = (vec2_t){corners[0]->x, corners[0]->z};
+    *out_max = *out_min;
+    for(int i = 1; i < 8; i++) {
+        out_min->x = MIN(out_min->x, corners[i]->x);
+        out_min->z = MIN(out_min->z, corners[i]->z);
+        out_max->x = MAX(out_max->x, corners[i]->x);
+        out_max->z = MAX(out_max->z, corners[i]->z);
+    }
+}
+
+static bool g_ent_visible(uint16_t playermask, uint32_t uid, const struct obb *obb)
+{
+    if(!s_gs.map)
+        return true;
+
+    uint32_t flags = G_FlagsGet(uid);
+    if(flags & ENTITY_FLAG_MARKER)
+        return true;
+
+    if(!(flags & ENTITY_FLAG_MOVABLE)
+    ||  (flags & ENTITY_FLAG_RESOURCE)
+    ||  (flags & ENTITY_FLAG_BUILDING)) {
+        return G_Fog_ObjExplored(playermask, uid, obb);
+    }
+
+    return G_Fog_ObjVisible(playermask, obb);
+}
+
+static bool g_entities_equal(uint32_t *a, uint32_t *b)
+{
+    return ((*a) == (*b));
+}
+
+static bool g_draw_cands_equal(struct draw_cand *a, struct draw_cand *b)
+{
+    return (a->uid == b->uid);
+}
+
+static void g_clear_map_state(void)
+{
+    if(s_gs.map) {
+
+        G_Move_FinishTick();
+        M_Raycast_Uninstall();
+        M_FreeMinimap(s_gs.map);
+        G_Garrison_Shutdown();
+        G_Building_Shutdown();
+        G_Fog_Shutdown();
+        G_Combat_Shutdown();
+        G_Formation_Shutdown();
+        G_Move_Shutdown();
+        G_Builder_Shutdown();
+        G_Resource_Shutdown();
+        G_Region_Shutdown();
+        G_Harvester_Shutdown();
+        G_Automation_Shutdown();
+        G_Group_Shutdown();
+        G_ClearPath_Shutdown();
+        G_Pos_Shutdown();
+        M_FoliageShutdown();
+        M_TerrainBake_Shutdown();
+        M_AL_DestroyTileUpdateBuffer();
+
+        AL_MapFree(s_gs.map);
+        s_gs.map = NULL;
+    }
+
+    if(s_gs.prev_tick_map) {
+        /* The render thread still owns the previous tick map. Wait 
+         * for it to complete before we free the buffer. */
+        Engine_WaitRenderWorkDone();
+        PF_FREE(s_gs.prev_tick_map);
+        s_gs.prev_tick_map = NULL;
+        R_PushCmd((struct rcmd){ R_GL_MoveClearState, 0 });
+    }
+}
+
+static void g_set_contextual_cursor(void)
+{
+    /* The orientation drag has already picked its target, so show the plain pointer. */
+    if(G_Move_InOrderDrag()) {
+        Cursor_SetRTSPointer(CURSOR_POINTER);
+        return;
+    }
+
+    if(G_MouseInTargetMode()) {
+        Cursor_SetRTSPointer(CURSOR_TARGET);
+        return;
+    }
+
+    int action = G_CurrContextualAction();
+    switch(action) {
+    case CTX_ACTION_ATTACK:
+        Cursor_SetRTSPointer(CURSOR_ATTACK);
+        break;
+    case CTX_ACTION_NO_ATTACK:
+        Cursor_SetRTSPointer(CURSOR_NO_ATTACK);
+        break;
+    case CTX_ACTION_BUILD:
+        Cursor_SetRTSPointer(CURSOR_BUILD);
+        break;
+    case CTX_ACTION_GATHER: {
+        char name[256] = { [0] = '\0' };
+        G_Harvester_GetContextualCursor(name, sizeof(name));
+        Cursor_NamedSetRTSPointer(name);
+        break;
+    }
+    case CTX_ACTION_DROP_OFF:
+        Cursor_SetRTSPointer(CURSOR_DROP_OFF);
+        break;
+    case CTX_ACTION_TRANSPORT:
+        Cursor_SetRTSPointer(CURSOR_TRANSPORT);
+        break;
+    case CTX_ACTION_GARRISON:
+        Cursor_SetRTSPointer(CURSOR_GARRISON);
+        break;
+    default:
+        Cursor_SetRTSPointer(CURSOR_POINTER);
+        break;
+    }
+}
+
+static void g_change_simstate(void)
+{
+    if(s_gs.ss == s_gs.requested_ss)
+        return;
+
+    uint32_t curr_tick = SDL_GetTicks();
+    switch(s_gs.requested_ss) {
+    case G_RUNNING: {
+
+        uint32_t delta = curr_tick - s_gs.ss_change_tick;
+        uint32_t curr;
+        kh_foreach_key(s_gs.active, curr, {
+           
+            uint32_t flags = G_FlagsGet(curr);
+            if(!(flags & ENTITY_FLAG_ANIMATED))
+                continue;
+            A_AddTimeDelta(curr, delta);
+        });
+        Audio_Resume(delta);
+        if(s_gs.map) {
+            G_Combat_AddTimeDelta(delta);
+        }
+        Sprite_AddTimeDelta(delta);
+        break;
+    }
+    case G_PAUSED_FULL:
+    case G_PAUSED_UI_RUNNING:
+        if(s_gs.ss == G_RUNNING) {
+            Audio_Pause();
+        }
+        break;
+    default: assert(0);
+    }
+
+    E_FlushEventQueue();
+
+    E_Global_Notify(EVENT_GAME_SIMSTATE_CHANGED, (void*)s_gs.requested_ss, ES_ENGINE);
+    s_gs.ss_change_tick = curr_tick;
+    s_gs.ss = s_gs.requested_ss;
+}
+
+static void g_create_settings(void)
+{
+    ss_e status;
+    (void)status;
+
+    status = Settings_Create((struct setting){
+        .name = "pf.game.healthbar_mode",
+        .val = (struct sval) {
+            .type = ST_TYPE_INT,
+            .as_int = HB_MODE_DAMAGED
+        },
+        .prio = 0,
+        .validate = hb_mode_validate,
+        .commit = NULL,
+    });
+    assert(status == SS_OKAY);
+
+    status = Settings_Create((struct setting){
+        .name = "pf.game.fog_of_war_enabled",
+        .val = (struct sval) {
+            .type = ST_TYPE_BOOL,
+            .as_bool = true
+        },
+        .prio = 0,
+        .validate = bool_val_validate,
+        .commit = NULL,
+    });
+    assert(status == SS_OKAY);
+
+    status = Settings_Create((struct setting){
+        .name = "pf.game.default_camera_zoom",
+        .val = (struct sval) {
+            .type = ST_TYPE_INT,
+            .as_int = 150
+        },
+        .prio = 0,
+        .validate = cam_zoom_validate,
+        .commit = cam_zoom_commit,
+    });
+    assert(status == SS_OKAY);
+
+    status = Settings_Create((struct setting){
+        .name = "pf.game.camera_projection",
+        .val = (struct sval) {
+            .type = ST_TYPE_INT,
+            .as_int = CAM_PROJ_PERSPECTIVE
+        },
+        .prio = 0,
+        .validate = cam_projection_validate,
+        .commit = NULL, /* Seeds new cameras; the RTS controller re-samples it */
+    });
+    assert(status == SS_OKAY);
+
+    status = Settings_Create((struct setting){
+        .name = "pf.game.camera_tilt",
+        .val = (struct sval) {
+            .type = ST_TYPE_INT,
+            .as_int = CAM_TILT_DEFAULT_DEGREES
+        },
+        .prio = 0,
+        .validate = cam_tilt_validate,
+        .commit = NULL, /* Seeds the camera; the RTS controller re-samples it */
+    });
+    assert(status == SS_OKAY);
+
+    status = Settings_Create((struct setting){
+        .name = "pf.game.movement_hz",
+        .val = (struct sval) {
+            .type = ST_TYPE_INT,
+            .as_int = 20
+        },
+        .prio = 0,
+        .validate = move_hz_validate,
+        .commit = move_hz_commit,
+    });
+    assert(status == SS_OKAY);
+
+    status = Settings_Create((struct setting){
+        .name = "pf.game.combat_hz",
+        .val = (struct sval) {
+            .type = ST_TYPE_FLOAT,
+            .as_float = 1.0
+        },
+        .prio = 0,
+        .validate = combat_hz_validate,
+        .commit = combat_hz_commit,
+    });
+    assert(status == SS_OKAY);
+
+    status = Settings_Create((struct setting){
+        .name = "pf.game.movement_use_gpu",
+        .val = (struct sval) {
+            .type = ST_TYPE_BOOL,
+            .as_bool = false
+        },
+        .prio = 0,
+        .validate = bool_val_validate,
+        .commit = move_gpu_commit,
+    });
+    assert(status == SS_OKAY);
+
+    status = Settings_Create((struct setting){
+        .name = "pf.game.disable_single_unit_targeting",
+        .val = (struct sval) {
+            .type = ST_TYPE_BOOL,
+            .as_bool = false
+        },
+        .prio = 0,
+        .validate = bool_val_validate,
+        .commit = NULL,
+    });
+    assert(status == SS_OKAY);
+
+    status = Settings_Create((struct setting){
+        .name = "pf.game.show_map_foliage",
+        .val = (struct sval) {
+            .type = ST_TYPE_BOOL,
+            .as_bool = false
+        },
+        .prio = 0,
+        .validate = bool_val_validate,
+        .commit = NULL,
+    });
+    assert(status == SS_OKAY);
+
+    status = Settings_Create((struct setting){
+        .name = "pf.video.lod_enabled",
+        .val = (struct sval) {
+            .type = ST_TYPE_BOOL,
+            .as_bool = true
+        },
+        .prio = 0,
+        .validate = bool_val_validate,
+        .commit = NULL,
+    });
+    assert(status == SS_OKAY);
+
+    status = Settings_Create((struct setting){
+        .name = "pf.video.lod_dist1",
+        .val = (struct sval) {
+            .type = ST_TYPE_FLOAT,
+            .as_float = 300.0f
+        },
+        .prio = 0,
+        .validate = lod_dist_validate,
+        .commit = NULL,
+    });
+    assert(status == SS_OKAY);
+
+    status = Settings_Create((struct setting){
+        .name = "pf.video.lod_dist2",
+        .val = (struct sval) {
+            .type = ST_TYPE_FLOAT,
+            .as_float = 450.0f
+        },
+        .prio = 0,
+        .validate = lod_dist_validate,
+        .commit = NULL,
+    });
+    assert(status == SS_OKAY);
+
+    status = Settings_Create((struct setting){
+        .name = "pf.video.billboards_enabled",
+        .val = (struct sval) {
+            .type = ST_TYPE_BOOL,
+            .as_bool = true
+        },
+        .prio = 0,
+        .validate = bool_val_validate,
+        .commit = billboards_en_commit,
+    });
+    assert(status == SS_OKAY);
+
+    /* Threshold past which entities with a baked atlas render as billboards:
+     * the camera height under an orthographic projection, the per-entity
+     * camera distance under a perspective one. 0 renders them as billboards
+     * at every zoom level.
+     */
+    status = Settings_Create((struct setting){
+        .name = "pf.video.billboard_dist",
+        .val = (struct sval) {
+            .type = ST_TYPE_FLOAT,
+            .as_float = 340.0f
+        },
+        .prio = 0,
+        .validate = lod_dist_validate,
+        .commit = NULL,
+    });
+    assert(status == SS_OKAY);
+
+    status = Settings_Create((struct setting){
+        .name = "pf.video.water_prune_radius",
+        .val = (struct sval) {
+            .type = ST_TYPE_INT,
+            .as_int = 8
+        },
+        .prio = 0,
+        .validate = water_prune_radius_validate,
+        .commit = NULL,
+    });
+    assert(status == SS_OKAY);
+
+    status = Settings_Create((struct setting){
+        .name = "pf.video.shadows_enabled",
+        .val = (struct sval) {
+            .type = ST_TYPE_BOOL,
+            .as_bool = true 
+        },
+        .prio = 0,
+        .validate = bool_val_validate,
+        .commit = shadows_en_commit,
+    });
+    assert(status == SS_OKAY);
+
+    status = Settings_Create((struct setting){
+        .name = "pf.video.terrain_bake",
+        .val = (struct sval) {
+            .type = ST_TYPE_BOOL,
+            .as_bool = true
+        },
+        .prio = 0,
+        .validate = bool_val_validate,
+        .commit = NULL,
+    });
+    assert(status == SS_OKAY);
+
+    status = Settings_Create((struct setting){
+        .name = "pf.video.terrain_bake_res",
+        .val = (struct sval) {
+            .type = ST_TYPE_INT,
+            .as_int = 2048
+        },
+        .prio = 0,
+        .validate = terrain_bake_res_validate,
+        .commit = terrain_bake_commit,
+    });
+    assert(status == SS_OKAY);
+
+    status = Settings_Create((struct setting){
+        .name = "pf.video.terrain_bake_compress",
+        .val = (struct sval) {
+            .type = ST_TYPE_BOOL,
+            .as_bool = true
+        },
+        .prio = 0,
+        .validate = bool_val_validate,
+        .commit = terrain_bake_commit,
+    });
+    assert(status == SS_OKAY);
+
+    status = Settings_Create((struct setting){
+        .name = "pf.video.use_batch_rendering",
+        .val = (struct sval) {
+            .type = ST_TYPE_BOOL,
+            .as_bool = true 
+        },
+        .prio = 0,
+        .validate = bool_val_validate,
+        .commit = batching_en_commit,
+    });
+    assert(status == SS_OKAY);
+
+    status = Settings_Create((struct setting){
+        .name = "pf.debug.navigation_layer",
+        .val = (struct sval) {
+            .type = ST_TYPE_INT,
+            .as_int = 0
+        },
+        .prio = 0,
+        .validate = nav_layer_validate,
+        .commit = NULL,
+    });
+    assert(status == SS_OKAY);
+
+    status = Settings_Create((struct setting){
+        .name = "pf.debug.log_mem_stats",
+        .val = (struct sval) {
+            .type = ST_TYPE_BOOL,
+            .as_bool = false
+        },
+        .prio = 0,
+        .validate = bool_val_validate,
+        .commit = NULL,
+    });
+    assert(status == SS_OKAY);
+
+    status = Settings_Create((struct setting){
+        .name = "pf.debug.log_call_graphs",
+        .val = (struct sval) {
+            .type = ST_TYPE_BOOL,
+            .as_bool = false
+        },
+        .prio = 0,
+        .validate = bool_val_validate,
+        .commit = NULL,
+    });
+    assert(status == SS_OKAY);
+
+    /* The shortest frame dumped by pf.debug.log_call_graphs; 0 samples one
+     * frame in every LOG_FREQUENCY regardless of its length.
+     */
+    status = Settings_Create((struct setting){
+        .name = "pf.debug.call_graph_min_ms",
+        .val = (struct sval) {
+            .type = ST_TYPE_INT,
+            .as_int = 40
+        },
+        .prio = 0,
+        .validate = int_validate,
+        .commit = NULL,
+    });
+    assert(status == SS_OKAY);
+
+    status = Settings_Create((struct setting){
+        .name = "pf.debug.nav_field_carry",
+        .val = (struct sval) {
+            .type = ST_TYPE_BOOL,
+            .as_bool = true
+        },
+        .prio = 0,
+        .validate = bool_val_validate,
+        .commit = NULL,
+    });
+    assert(status == SS_OKAY);
+
+    status = Settings_Create((struct setting){
+        .name = "pf.debug.move_parallel_executor",
+        .val = (struct sval) {
+            .type = ST_TYPE_BOOL,
+            .as_bool = true
+        },
+        .prio = 0,
+        .validate = bool_val_validate,
+        .commit = NULL,
+    });
+    assert(status == SS_OKAY);
+
+    status = Settings_Create((struct setting){
+        .name = "pf.debug.perf_hw_counters",
+        .val = (struct sval) {
+            .type = ST_TYPE_BOOL,
+            .as_bool = false
+        },
+        .prio = 0,
+        .validate = bool_val_validate,
+        .commit = perf_hw_counters_commit,
+    });
+    assert(status == SS_OKAY);
+
+    status = Settings_Create((struct setting){
+        .name = "pf.debug.log_perf_csv",
+        .val = (struct sval) {
+            .type = ST_TYPE_BOOL,
+            .as_bool = false
+        },
+        .prio = 0,
+        .validate = bool_val_validate,
+        .commit = NULL,
+    });
+    assert(status == SS_OKAY);
+
+    status = Settings_Create((struct setting){
+        .name = "pf.debug.gpu_move_parity",
+        .val = (struct sval) {
+            .type = ST_TYPE_BOOL,
+            .as_bool = false
+        },
+        .prio = 0,
+        .validate = bool_val_validate,
+        .commit = NULL,
+    });
+    assert(status == SS_OKAY);
+
+    status = Settings_Create((struct setting){
+        .name = "pf.debug.log_combat_diag",
+        .val = (struct sval) {
+            .type = ST_TYPE_BOOL,
+            .as_bool = false
+        },
+        .prio = 0,
+        .validate = bool_val_validate,
+        .commit = NULL,
+    });
+    assert(status == SS_OKAY);
+
+    status = Settings_Create((struct setting){
+        .name = "pf.debug.log_cp_captures",
+        .val = (struct sval) {
+            .type = ST_TYPE_BOOL,
+            .as_bool = false
+        },
+        .prio = 0,
+        .validate = bool_val_validate,
+        .commit = NULL,
+    });
+    assert(status == SS_OKAY);
+
+    /* Per-tick [mv-trace] lines for units of at least this selection radius; negative = off */
+    status = Settings_Create((struct setting){
+        .name = "pf.debug.log_move_trace_min_radius",
+        .val = (struct sval) {
+            .type = ST_TYPE_FLOAT,
+            .as_float = -1.0f
+        },
+        .prio = 0,
+        .validate = float_val_validate,
+        .commit = NULL,
+    });
+    assert(status == SS_OKAY);
+
+    status = Settings_Create((struct setting){
+        .name = "pf.debug.show_navigation_cost_base",
+        .val = (struct sval) {
+            .type = ST_TYPE_BOOL,
+            .as_bool = false
+        },
+        .prio = 0,
+        .validate = bool_val_validate,
+        .commit = NULL,
+    });
+    assert(status == SS_OKAY);
+
+    status = Settings_Create((struct setting){
+        .name = "pf.debug.show_last_cmd_flow_field",
+        .val = (struct sval) {
+            .type = ST_TYPE_BOOL,
+            .as_bool = false
+        },
+        .prio = 0,
+        .validate = bool_val_validate,
+        .commit = NULL,
+    });
+    assert(status == SS_OKAY);
+
+    status = Settings_Create((struct setting){
+        .name = "pf.debug.show_first_sel_movestate",
+        .val = (struct sval) {
+            .type = ST_TYPE_BOOL,
+            .as_bool = false
+        },
+        .prio = 0,
+        .validate = bool_val_validate,
+        .commit = NULL,
+    });
+    assert(status == SS_OKAY);
+
+    status = Settings_Create((struct setting){
+        .name = "pf.debug.show_first_sel_combined_hrvo",
+        .val = (struct sval) {
+            .type = ST_TYPE_BOOL,
+            .as_bool = false 
+        },
+        .prio = 0,
+        .validate = bool_val_validate,
+        .commit = NULL,
+    });
+
+    status = Settings_Create((struct setting){
+        .name = "pf.debug.show_enemy_seek_fields",
+        .val = (struct sval) {
+            .type = ST_TYPE_BOOL,
+            .as_bool = false 
+        },
+        .prio = 0,
+        .validate = bool_val_validate,
+        .commit = NULL,
+    });
+
+    status = Settings_Create((struct setting){
+        .name = "pf.debug.enemy_seek_fields_faction_id",
+        .val = (struct sval) {
+            .type = ST_TYPE_INT,
+            .as_int = 0
+        },
+        .prio = 0,
+        .validate = faction_id_validate,
+        .commit = NULL,
+    });
+
+    status = Settings_Create((struct setting){
+        .name = "pf.debug.show_navigation_blockers",
+        .val = (struct sval) {
+            .type = ST_TYPE_BOOL,
+            .as_bool = false 
+        },
+        .prio = 0,
+        .validate = bool_val_validate,
+        .commit = NULL,
+    });
+
+    status = Settings_Create((struct setting){
+        .name = "pf.debug.show_navigation_portals",
+        .val = (struct sval) {
+            .type = ST_TYPE_BOOL,
+            .as_bool = false 
+        },
+        .prio = 0,
+        .validate = bool_val_validate,
+        .commit = NULL,
+    });
+
+    status = Settings_Create((struct setting){
+        .name = "pf.debug.show_navigation_island_ids",
+        .val = (struct sval) {
+            .type = ST_TYPE_BOOL,
+            .as_bool = false 
+        },
+        .prio = 0,
+        .validate = bool_val_validate,
+        .commit = NULL,
+    });
+
+    status = Settings_Create((struct setting){
+        .name = "pf.debug.show_navigation_local_island_ids",
+        .val = (struct sval) {
+            .type = ST_TYPE_BOOL,
+            .as_bool = false 
+        },
+        .prio = 0,
+        .validate = bool_val_validate,
+        .commit = NULL,
+    });
+
+    status = Settings_Create((struct setting){
+        .name = "pf.debug.show_chunk_boundaries",
+        .val = (struct sval) {
+            .type = ST_TYPE_BOOL,
+            .as_bool = false 
+        },
+        .prio = 0,
+        .validate = bool_val_validate,
+        .commit = NULL,
+    });
+
+    status = Settings_Create((struct setting){
+        .name = "pf.debug.show_faction_vision",
+        .val = (struct sval) {
+            .type = ST_TYPE_INT,
+            .as_int = -1 /* -1 for none, else the faction ID to show vision for */
+        },
+        .prio = 0,
+        .validate = fac_vision_validate,
+        .commit = NULL,
+    });
+
+    status = Settings_Create((struct setting){
+        .name = "pf.debug.show_combat_targets",
+        .val = (struct sval) {
+            .type = ST_TYPE_BOOL,
+            .as_bool = false
+        },
+        .prio = 0,
+        .validate = bool_val_validate,
+        .commit = NULL,
+    });
+
+    status = Settings_Create((struct setting){
+        .name = "pf.debug.show_combat_ranges",
+        .val = (struct sval) {
+            .type = ST_TYPE_BOOL,
+            .as_bool = false
+        },
+        .prio = 0,
+        .validate = bool_val_validate,
+        .commit = NULL,
+    });
+
+    status = Settings_Create((struct setting){
+        .name = "pf.debug.show_formations",
+        .val = (struct sval) {
+            .type = ST_TYPE_BOOL,
+            .as_bool = false
+        },
+        .prio = 0,
+        .validate = bool_val_validate,
+        .commit = NULL,
+    });
+
+    status = Settings_Create((struct setting){
+        .name = "pf.debug.show_formations_occupied_field",
+        .val = (struct sval) {
+            .type = ST_TYPE_BOOL,
+            .as_bool = false
+        },
+        .prio = 0,
+        .validate = bool_val_validate,
+        .commit = NULL,
+    });
+
+    status = Settings_Create((struct setting){
+        .name = "pf.debug.show_formations_assignment",
+        .val = (struct sval) {
+            .type = ST_TYPE_BOOL,
+            .as_bool = false
+        },
+        .prio = 0,
+        .validate = bool_val_validate,
+        .commit = NULL,
+    });
+
+    status = Settings_Create((struct setting){
+        .name = "pf.debug.formation_cell_index",
+        .val = (struct sval) {
+            .type = ST_TYPE_INT,
+            .as_int = 0
+        },
+        .prio = 0,
+        .validate = int_validate,
+        .commit = NULL,
+    });
+
+    status = Settings_Create((struct setting){
+        .name = "pf.debug.show_formations_cell_arrival_field",
+        .val = (struct sval) {
+            .type = ST_TYPE_BOOL,
+            .as_bool = false
+        },
+        .prio = 0,
+        .validate = bool_val_validate,
+        .commit = NULL,
+    });
+
+    status = Settings_Create((struct setting){
+        .name = "pf.debug.show_group_arrival_field",
+        .val = (struct sval) {
+            .type = ST_TYPE_BOOL,
+            .as_bool = false
+        },
+        .prio = 0,
+        .validate = bool_val_validate,
+        .commit = NULL,
+    });
+
+    status = Settings_Create((struct setting){
+        .name = "pf.debug.show_formations_forces",
+        .val = (struct sval) {
+            .type = ST_TYPE_BOOL,
+            .as_bool = false
+        },
+        .prio = 0,
+        .validate = bool_val_validate,
+        .commit = NULL,
+    });
+
+    status = Settings_Create((struct setting){
+        .name = "pf.debug.show_harvester_state",
+        .val = (struct sval) {
+            .type = ST_TYPE_BOOL,
+            .as_bool = false
+        },
+        .prio = 0,
+        .validate = bool_val_validate,
+        .commit = NULL,
+    });
+
+    status = Settings_Create((struct setting){
+        .name = "pf.debug.show_automation_state",
+        .val = (struct sval) {
+            .type = ST_TYPE_BOOL,
+            .as_bool = false
+        },
+        .prio = 0,
+        .validate = bool_val_validate,
+        .commit = NULL,
+    });
+}
+
+static void g_render_minimap_units(void)
+{
+    ASSERT_IN_MAIN_THREAD();
+    assert(Sched_UsingBigStack());
+    PERF_ENTER();
+
+    STALLOC(vec2_t, positions, kh_size(s_gs.active));
+    STALLOC(vec3_t, colors, kh_size(s_gs.active));
+    size_t nunits = 0;
+
+    vec3_t color_map[MAX_FACTIONS];
+    G_GetFactions(NULL, color_map, NULL);
+
+    uint32_t curr;
+    kh_foreach_key(s_gs.active, curr, {
+
+        uint32_t flags = G_FlagsGet(curr);
+        if(!s_gs.minimap_render_all 
+        && !(flags & (ENTITY_FLAG_MOVABLE | ENTITY_FLAG_BUILDING)))
+            continue;
+        vec2_t xz_pos = G_Pos_GetXZ(curr);
+        if(!G_Fog_PlayerVisible(xz_pos))
+            continue;
+        vec3_t norm_color = color_map[G_GetFactionID(curr)];
+        PFM_Vec3_Scale(&norm_color, 1.0f / 255, &norm_color);
+
+        positions[nunits] = M_WorldCoordsToNormMapCoords(s_gs.map, xz_pos);
+        colors[nunits] = norm_color;
+        nunits++;
+    });
+
+    M_RenderMinimapUnits(s_gs.map, nunits, positions, colors);
+
+    STFREE(positions);
+    STFREE(colors);
+
+    PERF_RETURN_VOID();
+}
+
+static void g_remove_queued(void)
+{
+    for(int i = 0; i < vec_size(&s_gs.removed); i++) {
+        uint32_t curr = vec_AT(&s_gs.removed, i);
+        G_RemoveEntity(curr);
+        G_FreeEntity(curr);
+    }
+    vec_entity_reset(&s_gs.removed);
+}
+
+static void *g_water_lod_priv(uint32_t uid, bool lod_enabled)
+{
+    const struct entity *ent = AL_EntityGet(uid);
+    if(!ent)
+        return NULL;
+    return lod_enabled ? g_lod_priv_coarsest(ent) : ent->render_private;
+}
+
+static void g_prune_water_input(struct render_input *in)
+{
+    PERF_ENTER();
+    assert(s_gs.map);
+
+    struct sval lod_setting;
+    bool lod_enabled = (Settings_Get("pf.video.lod_enabled", &lod_setting) == SS_OKAY)
+                     && lod_setting.as_bool;
+
+    for(int i = vec_size(&in->cam_vis_stat) - 1; i >= 0; i--) {
+        struct ent_stat_rstate *rstate = &vec_AT(&in->cam_vis_stat, i);
+        if(!M_PointNearWater(s_gs.map, G_Pos_GetXZ(rstate->uid))) {
+            vec_rstat_del(&in->cam_vis_stat, i);
+        }else{
+            void *priv = g_water_lod_priv(rstate->uid, lod_enabled);
+            if(priv)
+                rstate->render_private = priv;
+        }
+    }
+
+    for(int i = vec_size(&in->light_vis_stat) - 1; i >= 0; i--) {
+        const struct ent_stat_rstate *rstate = &vec_AT(&in->light_vis_stat, i);
+        if(!M_PointNearWater(s_gs.map, G_Pos_GetXZ(rstate->uid))) {
+            vec_rstat_del(&in->light_vis_stat, i);
+        }
+    }
+
+    for(int i = vec_size(&in->cam_vis_anim) - 1; i >= 0; i--) {
+        struct ent_anim_rstate *rstate = &vec_AT(&in->cam_vis_anim, i);
+        if(!M_PointNearWater(s_gs.map, G_Pos_GetXZ(rstate->uid))) {
+            vec_ranim_del(&in->cam_vis_anim, i);
+        }else{
+            void *priv = g_water_lod_priv(rstate->uid, lod_enabled);
+            if(priv)
+                rstate->render_private = priv;
+        }
+    }
+
+    for(int i = vec_size(&in->light_vis_anim) - 1; i >= 0; i--) {
+        const struct ent_anim_rstate *rstate = &vec_AT(&in->light_vis_anim, i);
+        if(!M_PointNearWater(s_gs.map, G_Pos_GetXZ(rstate->uid))) {
+            vec_ranim_del(&in->light_vis_anim, i);
+        }
+    }
+
+    /* The water passes render no billboards */
+    vec_rbill_reset(&in->cam_vis_bill);
+    vec_rbill_reset(&in->light_vis_bill);
+
+    PERF_RETURN_VOID();
+}
+
+void g_delete_gpuid(uint32_t uid)
+{
+    khiter_t k = kh_get(entity, s_gs.dynamic, uid);
+    assert(k != kh_end(s_gs.dynamic));
+    kh_del(entity, s_gs.dynamic, k);
+
+    k = kh_get(id, s_gs.ent_gpu_id_map, uid);
+    assert(k != kh_end(s_gs.ent_gpu_id_map));
+    uint32_t old_id = kh_value(s_gs.ent_gpu_id_map, k);
+    uint32_t old_size = kh_size(s_gs.ent_gpu_id_map);
+    kh_del(id, s_gs.ent_gpu_id_map, k);
+
+    k = kh_get(id, s_gs.gpu_id_ent_map, old_id);
+    assert(k != kh_end(s_gs.gpu_id_ent_map));
+    kh_del(id, s_gs.gpu_id_ent_map, k);
+
+    /* Make sure all existing values in the GPU ID table 
+     * are in the range of [1:table_size] */
+    k = kh_get(id, s_gs.gpu_id_ent_map, old_size);
+    if(k != kh_end(s_gs.gpu_id_ent_map)) {
+
+        uint32_t uid = kh_value(s_gs.gpu_id_ent_map, k);
+        kh_del(id, s_gs.gpu_id_ent_map, k);
+
+        k = kh_get(id, s_gs.ent_gpu_id_map, uid);
+        assert(k != kh_end(s_gs.ent_gpu_id_map));
+        kh_value(s_gs.ent_gpu_id_map, k) = old_id;
+
+        int ret;
+        k = kh_put(id, s_gs.gpu_id_ent_map, old_id, &ret);
+        assert(ret != -1);
+        kh_value(s_gs.gpu_id_ent_map, k) = uid;
+    }
+
+    assert(kh_size(s_gs.dynamic) == kh_size(s_gs.ent_gpu_id_map));
+    assert(kh_size(s_gs.ent_gpu_id_map) == kh_size(s_gs.gpu_id_ent_map));
+}
+
+static void on_update_ui(void *user, void *event)
+{
+    if(!s_gs.show_unit_icons)
+        return;
+
+    struct nk_style_item bg_style = (struct nk_style_item){
+        .type = NK_STYLE_ITEM_COLOR,
+        .data.color = (struct nk_color){0, 0, 0, 0}
+    };
+
+    struct nk_context *ctx = UI_GetContext();
+    nk_style_push_style_item(ctx, &ctx->style.window.fixed_background, bg_style);
+    nk_style_push_vec2(ctx, &ctx->style.window.padding, nk_vec2(0.0f, 0.0f));
+    nk_style_push_vec2(ctx, &ctx->style.window.spacing, nk_vec2(0.0f, 0.0f));
+
+    for(int i = 0; i < vec_size(&s_gs.visible); i++) {
+
+        uint32_t uid = vec_AT(&s_gs.visible, i);
+        const char *icons[MAX_ICONS];
+        size_t nicons = Entity_GetIcons(uid, ARR_SIZE(icons), icons);
+        if(nicons == 0 || G_EntityIsZombie(uid))
+            continue;
+
+        char name[256];
+        pf_snprintf(name, sizeof(name), "__icons__.%x", uid);
+
+        const vec2_t vres = (vec2_t){1920, 1080};
+        const vec2_t adj_vres = UI_ArAdjustedVRes(vres);
+
+        vec2_t ss_pos = Entity_TopScreenPos(uid, adj_vres.x, adj_vres.y);
+        const int width = 32 * nicons;
+        const int height = 32;
+
+        float yoffset = 0;
+        if((G_FlagsGet(uid) & ENTITY_FLAG_STORAGE_SITE) && G_StorageSite_GetShowUI()) {
+            yoffset = G_StorageSite_GetWindowHeight(uid) / 8.0f;
+        }
+
+        const vec2_t pos = (vec2_t){ss_pos.x - width/2, ss_pos.y - 14 + yoffset};
+        const int flags = NK_WINDOW_NOT_INTERACTIVE | NK_WINDOW_BACKGROUND | NK_WINDOW_NO_SCROLLBAR;
+
+        struct rect adj_bounds = UI_BoundsForAspectRatio(
+            (struct rect){pos.x, pos.y, width, height}, 
+            vres, adj_vres, ANCHOR_DEFAULT
+        );
+
+        if(nk_begin_with_vres(ctx, name, 
+            (struct nk_rect){adj_bounds.x, adj_bounds.y, adj_bounds.w, adj_bounds.h}, 
+            flags, (struct nk_vec2i){adj_vres.x, adj_vres.y})) {
+
+            nk_layout_row_begin(ctx, NK_STATIC, 32, nicons);
+            nk_layout_row_push(ctx, 32);
+            for(int i = 0; i < nicons; i++) {
+                nk_image_texpath(ctx, icons[i]);
+            }
+        }
+        nk_end(ctx);
+    }
+    nk_style_pop_vec2(ctx);
+    nk_style_pop_vec2(ctx);
+    nk_style_pop_style_item(ctx);
+}
+
+/*****************************************************************************/
+/* EXTERN FUNCTIONS                                                          */
+/*****************************************************************************/
+
+bool G_Init(void)
+{
+    ASSERT_IN_MAIN_THREAD();
+
+    vec_entity_init(&s_gs.visible);
+    vec_drawcand_init(&s_gs.draw_cands);
+    vec_obb_init(&s_gs.visible_obbs);
+    vec_entity_init(&s_gs.cull_cands);
+    vec_entity_init(&s_gs.removed);
+    g_create_settings();
+    s_gs.attack_on_rclick = true;
+
+    vec_entity_resize(&s_gs.visible, 2048);
+    vec_drawcand_resize(&s_gs.draw_cands, 2048);
+    vec_obb_resize(&s_gs.visible_obbs, 2048);
+    vec_entity_resize(&s_gs.cull_cands, 2048);
+
+    if(!stalloc_init(&s_gs.render_data_stack))
+        return false;
+
+    s_gs.active = kh_init(entity);
+    if(!s_gs.active)
+        goto fail_active;
+
+    s_gs.ent_faction_map = kh_init(id);
+    if(!s_gs.ent_faction_map)
+        goto fail_faction;
+
+    s_gs.ent_visrange_map = kh_init(range);
+    if(!s_gs.ent_visrange_map)
+        goto fail_visrange;
+
+    s_gs.selection_radiuses = kh_init(range);
+    if(!s_gs.selection_radiuses)
+        goto fail_sel_rad;
+
+    s_gs.dynamic = kh_init(entity);
+    if(!s_gs.dynamic)
+        goto fail_dynamic;
+
+    s_gs.ent_gpu_id_map = kh_init(id);
+    if(!s_gs.ent_gpu_id_map)
+        goto fail_ent_gpu_id_map;
+
+    s_gs.gpu_id_ent_map = kh_init(id);
+    if(!s_gs.ent_gpu_id_map)
+        goto fail_gpu_id_ent_map;
+
+    s_gs.ent_flag_map = kh_init(id);
+    if(!s_gs.ent_flag_map)
+        goto fail_ent_flag_map;
+
+    if(!g_init_camera())
+        goto fail_cam; 
+
+    if(!R_InitWS(&s_gs.ws[0]))
+        goto fail_ws;
+
+    if(!R_InitWS(&s_gs.ws[1])) {
+        R_DestroyWS(&s_gs.ws[0]);
+        goto fail_ws;
+    }
+
+    G_ClearState();
+
+    G_Sel_Init();
+    G_Sel_Enable();
+    G_Timer_Init();
+    G_StorageSite_Init();
+    G_Population_Init();
+
+    R_PushCmd((struct rcmd){ R_GL_WaterInit, 0 });
+
+    G_SetLightPos((vec3_t){120.0f, 150.0f, 120.0f});
+    G_SetAmbientLightColor((vec3_t){1.0f, 1.0f, 1.0f}); 
+    G_SetEmitLightColor((vec3_t){1.0f, 1.0f, 1.0f});
+    G_SetSkybox("", "");
+
+    s_gs.prev_tick_map = NULL;
+    s_gs.curr_ws_idx = 0;
+    s_gs.ss = G_RUNNING;
+    s_gs.requested_ss = G_RUNNING;
+
+    E_Global_Register(EVENT_UPDATE_UI, on_update_ui, NULL, 
+        G_RUNNING | G_PAUSED_UI_RUNNING | G_PAUSED_FULL);
+    return true;
+
+fail_ws:
+    Camera_Free(s_gs.active_cam);
+fail_cam:
+    kh_destroy(id, s_gs.ent_flag_map);
+fail_ent_flag_map:
+    kh_destroy(id, s_gs.gpu_id_ent_map);
+fail_gpu_id_ent_map:
+    kh_destroy(id, s_gs.ent_gpu_id_map);
+fail_ent_gpu_id_map:
+    kh_destroy(entity, s_gs.dynamic);
+fail_dynamic:
+    kh_destroy(range, s_gs.selection_radiuses);
+fail_sel_rad:
+    kh_destroy(range, s_gs.ent_visrange_map);
+fail_visrange:
+    kh_destroy(id, s_gs.ent_faction_map);
+fail_faction:
+    kh_destroy(entity, s_gs.active);
+fail_active:
+    return false;
+}
+
+bool G_LoadMap(SDL_RWops *stream, bool update_navgrid)
+{
+    PERF_ENTER();
+    ASSERT_IN_MAIN_THREAD();
+
+    g_clear_map_state();
+
+    size_t copysize = AL_MapShallowCopySize(stream);
+    s_gs.prev_tick_map = PF_MALLOC(copysize);
+    if(!s_gs.prev_tick_map)
+        PERF_RETURN(false);
+
+    s_gs.map = AL_MapFromPFMapStream(stream, update_navgrid);
+    if(!s_gs.map)
+        PERF_RETURN(false);
+
+    g_init_map();
+    M_AL_ShallowCopy((struct map*)s_gs.prev_tick_map, s_gs.map);
+
+    E_Global_Notify(EVENT_NEW_GAME, s_gs.map, ES_ENGINE);
+
+    PERF_RETURN(true);
+}
+
+void G_ClearState(void)
+{
+    PERF_ENTER();
+    G_Sel_Clear();
+    g_remove_queued();
+
+    uint32_t curr;
+    kh_foreach_key(s_gs.active, curr, {
+        /* The move markers are removed in G_Move_Shutdown */
+        uint32_t flags = G_FlagsGet(curr);
+        if(flags & ENTITY_FLAG_MARKER)
+            continue;
+        G_RemoveEntity(curr);
+        G_FreeEntity(curr);
+    });
+
+    kh_clear(entity, s_gs.active);
+    kh_clear(entity, s_gs.dynamic);
+    kh_clear(id, s_gs.ent_gpu_id_map);
+    kh_clear(id, s_gs.gpu_id_ent_map);
+    kh_clear(id, s_gs.ent_faction_map);
+    kh_clear(id, s_gs.ent_flag_map);
+    kh_clear(range, s_gs.ent_visrange_map);
+    kh_clear(range, s_gs.selection_radiuses);
+    vec_entity_reset(&s_gs.visible);
+    vec_drawcand_reset(&s_gs.draw_cands);
+    vec_obb_reset(&s_gs.visible_obbs);
+
+    g_clear_map_state();
+    M_MinimapClearBorderClr();
+
+    g_reset_camera(s_gs.active_cam);
+    G_SetActiveCamera(s_gs.active_cam, CAM_MODE_RTS);
+
+    G_Sel_Enable();
+    G_Fog_Enable();
+    G_StorageSite_ClearState();
+    G_Population_ClearState();
+
+    s_gs.factions_allocd = 0;
+    s_gs.hide_healthbars = false;
+    s_gs.minimap_render_all = false;
+    s_gs.show_unit_icons = false;
+
+    vec3_t white = (vec3_t){1.0f, 1.0f, 1.0f};
+    R_PushCmd((struct rcmd){
+        .func = R_GL_SetAmbientLightColor,
+        .nargs = 1,
+        .args = { R_PushArg(&white, sizeof(white)) },
+    });
+    R_PushCmd((struct rcmd){
+        .func = R_GL_SetLightEmitColor,
+        .nargs = 1,
+        .args = { R_PushArg(&white, sizeof(white)) },
+    });
+    G_SetLightPos((vec3_t){1.0f, 1.0f, 1.0f});
+
+    PERF_RETURN_VOID();
+}
+
+void G_FlushWork(void)
+{
+    G_Combat_FlushWork();
+    G_Move_FlushWork();
+}
+
+bool G_HasWork(void)
+{
+    return G_Combat_HasWork() || G_Move_HasWork();
+}
+
+void G_ClearRenderWork(void)
+{
+    Engine_WaitRenderWorkDone();
+    R_ClearWS(&s_gs.ws[0]);
+    R_ClearWS(&s_gs.ws[1]);
+}
+
+bool G_GetMinimapPos(float *out_x, float *out_y)
+{
+    ASSERT_IN_MAIN_THREAD();
+
+    if(!s_gs.map)
+        return false;
+
+    vec2_t center_pos;
+    M_GetMinimapPos(s_gs.map, &center_pos);
+    *out_x = center_pos.x;
+    *out_y = center_pos.y;
+    return true;
+}
+
+bool G_SetMinimapPos(float x, float y)
+{
+    ASSERT_IN_MAIN_THREAD();
+
+    if(!s_gs.map)
+        return false;
+
+    M_SetMinimapPos(s_gs.map, (vec2_t){x, y});
+    return true;
+}
+
+bool G_GetMinimapSize(int *out_size)
+{
+    ASSERT_IN_MAIN_THREAD();
+
+    if(!s_gs.map)
+        return false;
+
+    *out_size = M_GetMinimapSize(s_gs.map);
+    return true;
+}
+
+bool G_SetMinimapSize(int size)
+{
+    ASSERT_IN_MAIN_THREAD();
+
+    if(!s_gs.map)
+        return false;
+
+    M_SetMinimapSize(s_gs.map, size);
+    return true;
+}
+
+bool G_SetMinimapResizeMask(int mask)
+{
+    ASSERT_IN_MAIN_THREAD();
+
+    if(!s_gs.map)
+        return false;
+
+    M_SetMinimapResizeMask(s_gs.map, mask);
+    return true;
+}
+
+void G_SetMinimapRenderAllEntities(bool on)
+{
+    ASSERT_IN_MAIN_THREAD();
+    s_gs.minimap_render_all = on;
+}
+
+bool G_MouseOverMinimap(void)
+{
+    ASSERT_IN_MAIN_THREAD();
+
+    if(!s_gs.map)
+        return false;
+    return M_MouseOverMinimap(s_gs.map);
+}
+
+bool G_MapHeightAtPoint(vec2_t xz, float *out_height)
+{
+    ASSERT_IN_MAIN_THREAD();
+
+    if(!s_gs.map)
+        return false;
+
+    if(!M_PointInsideMap(s_gs.map, xz))
+        return false;
+
+    *out_height = M_HeightAtPoint(s_gs.map, xz);
+    return true;
+}
+
+bool G_MapClosestPathable(vec2_t xz, vec2_t *out, enum nav_layer layer)
+{
+    ASSERT_IN_MAIN_THREAD();
+
+    if(!s_gs.map) {
+        *out = xz;
+        return true;
+    }
+    return M_NavClosestPathable(s_gs.map, layer, xz, out);
+}
+
+bool G_MapLocationsReachable(vec2_t a, vec2_t b, enum nav_layer layer)
+{
+    ASSERT_IN_MAIN_THREAD();
+
+    if(!s_gs.map)
+        return true;
+    return M_NavLocationsReachable(s_gs.map, layer, a, b);
+}
+
+bool G_MapPositionPathable(vec2_t xz, enum nav_layer layer)
+{
+    ASSERT_IN_MAIN_THREAD();
+
+    if(!s_gs.map)
+        return false;
+    return M_NavPositionPathable(s_gs.map, layer, xz);
+}
+
+bool G_PointInsideMap(vec2_t xz)
+{
+    ASSERT_IN_MAIN_THREAD();
+
+    if(!s_gs.map)
+        return false;
+    return M_PointInsideMap(s_gs.map, xz);
+}
+
+bool G_PointOverWater(vec2_t xz)
+{
+    ASSERT_IN_MAIN_THREAD();
+
+    if(!s_gs.map)
+        return false;
+    return M_PointOverWater(s_gs.map, xz);
+}
+
+bool G_PointOverLand(vec2_t xz)
+{
+    ASSERT_IN_MAIN_THREAD();
+
+    if(!s_gs.map)
+        return false;
+    return M_PointOverLand(s_gs.map, xz);
+}
+
+bool G_MapAddSplat(int base_mat_idx, int accent_mat_idx)
+{
+    ASSERT_IN_MAIN_THREAD();
+
+    if(!s_gs.map)
+        return false;
+    return M_AddSplat(s_gs.map, base_mat_idx, accent_mat_idx);
+}
+
+bool G_MapRemoveSplat(int base_mat_idx, int accent_mat_idx)
+{
+    ASSERT_IN_MAIN_THREAD();
+    if(!s_gs.map)
+        return false;
+    return M_RemoveSplat(s_gs.map, base_mat_idx, accent_mat_idx);
+}
+
+void G_BakeNavDataForScene(void)
+{
+    PERF_ENTER();
+    ASSERT_IN_MAIN_THREAD();
+
+    uint32_t curr;
+    kh_foreach_key(s_gs.active, curr, {
+
+        uint32_t flags = G_FlagsGet(curr);
+        if(!(flags & ENTITY_FLAG_COLLISION))
+            continue;
+        if(flags & ENTITY_FLAG_MOVABLE)
+            continue;
+        if(flags & ENTITY_FLAG_BUILDING)
+            continue;
+        if(flags & ENTITY_FLAG_RESOURCE)
+            continue;
+
+        struct obb obb;
+        Entity_CurrentOBB(curr, &obb, false);
+        M_NavCutoutStaticObject(s_gs.map, &obb);
+        Sched_TryYield();
+    });
+
+    M_NavUpdatePortals(s_gs.map);
+    Sched_TryYield();
+
+    M_NavUpdateIslandsField(s_gs.map);
+    Sched_TryYield();
+
+    PERF_RETURN_VOID();
+}
+
+void G_Shutdown(void)
+{
+    ASSERT_IN_MAIN_THREAD();
+
+    E_Global_Unregister(EVENT_UPDATE_UI, on_update_ui);
+    G_ClearState();
+
+    R_DestroyWS(&s_gs.ws[0]);
+    R_DestroyWS(&s_gs.ws[1]);
+
+    R_PushCmd((struct rcmd){ R_GL_WaterShutdown, 0 });
+
+    G_Population_Shutdown();
+    G_StorageSite_Shutdown();
+    G_Timer_Shutdown();
+    G_Sel_Shutdown();
+
+    Camera_Free(s_gs.active_cam);
+
+    kh_destroy(entity, s_gs.active);
+    kh_destroy(entity, s_gs.dynamic);
+    kh_destroy(id, s_gs.ent_gpu_id_map);
+    kh_destroy(id, s_gs.gpu_id_ent_map);
+    kh_destroy(id, s_gs.ent_faction_map);
+    kh_destroy(id, s_gs.ent_flag_map);
+    kh_destroy(range, s_gs.ent_visrange_map);
+    kh_destroy(range, s_gs.selection_radiuses);
+    vec_drawcand_destroy(&s_gs.draw_cands);
+    vec_entity_destroy(&s_gs.visible);
+    vec_obb_destroy(&s_gs.visible_obbs);
+    vec_entity_destroy(&s_gs.cull_cands);
+    vec_entity_destroy(&s_gs.removed);
+    stalloc_destroy(&s_gs.render_data_stack);
+}
+
+void G_Update(void)
+{
+    PERF_ENTER();
+    ASSERT_IN_MAIN_THREAD();
+
+    uint64_t st0 = SDL_GetPerformanceCounter();
+    if(s_gs.map) {
+        G_Fog_UpdateVisionState();
+    }
+    s_stage_us[0] = stage_us(st0);
+
+    vec_entity_reset(&s_gs.visible);
+    vec_drawcand_reset(&s_gs.draw_cands);
+    vec_obb_reset(&s_gs.visible_obbs);
+
+    vec3_t pos = Camera_GetPos(s_gs.active_cam);
+    vec3_t dir = Camera_GetDir(s_gs.active_cam);
+
+    struct frustum cam_frust;
+    Camera_MakeFrustum(s_gs.active_cam, &cam_frust);
+
+    struct frustum light_frust;
+    R_LightVisibilityFrustum(s_gs.active_cam, s_gs.light_pos, &light_frust);
+
+    uint16_t pm = g_player_mask();
+    uint32_t curr;
+
+    st0 = SDL_GetPerformanceCounter();
+    if(s_gs.ss == G_RUNNING) {
+        A_Update();
+    }
+    s_stage_us[1] = stage_us(st0);
+    st0 = SDL_GetPerformanceCounter();
+    /* The advanced poses move the animated entities' bounds */
+    Entity_ClearOBBCache();
+
+    PERF_PUSH("visibility culling");
+    /* Narrow to entities positioned inside the camera or light footprint
+     * before building any OBB: constructing one costs a model matrix and a
+     * pose AABB lookup, and the scan was previously paid for every entity
+     * on the map no matter where the camera pointed.
+     */
+    vec2_t cmin, cmax, lmin, lmax;
+    g_frustum_xz_bounds(&cam_frust, &cmin, &cmax);
+    g_frustum_xz_bounds(&light_frust, &lmin, &lmax);
+    vec2_t qmin = (vec2_t){MIN(cmin.x, lmin.x) - CULL_QUERY_PAD,
+                           MIN(cmin.z, lmin.z) - CULL_QUERY_PAD};
+    vec2_t qmax = (vec2_t){MAX(cmax.x, lmax.x) + CULL_QUERY_PAD,
+                           MAX(cmax.z, lmax.z) + CULL_QUERY_PAD};
+
+    size_t nactive = kh_size(s_gs.active);
+    vec_entity_resize(&s_gs.cull_cands, nactive);
+    int ncands = G_Pos_EntsInRect(qmin, qmax, s_gs.cull_cands.array, nactive);
+    s_last_ncands = ncands;
+
+    for(int ci = 0; ci < ncands; ci++) {
+
+        curr = s_gs.cull_cands.array[ci];
+        struct obb obb;
+        Entity_CurrentOBB(curr, &obb, false);
+        bool vis_checked = false;
+        bool vis = false;
+        uint32_t passes = 0;
+
+        /* Note that there may be some false positives due to using the fast frustum cull. */
+        if(C_FrustumOBBIntersectionFast(&cam_frust, &obb) != VOLUME_INTERSEC_OUTSIDE) {
+            vis = g_ent_visible(pm, curr, &obb);
+            vis_checked = true;
+            if(vis) {
+                vec_entity_push(&s_gs.visible, curr);
+                vec_obb_push(&s_gs.visible_obbs, obb);
+                passes |= DRAW_PASS_CAM;
+            }
+        }
+
+        if(C_FrustumOBBIntersectionFast(&light_frust, &obb) != VOLUME_INTERSEC_OUTSIDE) {
+            if(!vis_checked) {
+                vis = g_ent_visible(pm, curr, &obb);
+            }
+            uint32_t flags = G_FlagsGet(curr);
+            if(vis || !(flags & ENTITY_FLAG_MOVABLE)) {
+                passes |= DRAW_PASS_LIGHT;
+            }
+        }
+
+        if(passes) {
+            vec_drawcand_push(&s_gs.draw_cands, (struct draw_cand){curr, passes});
+        }
+    }
+    PERF_POP();
+
+    vec_entity_resize(&s_gs.cull_cands, vec_size(&s_gs.draw_cands));
+    for(int i = 0; i < vec_size(&s_gs.draw_cands); i++)
+        s_gs.cull_cands.array[i] = vec_AT(&s_gs.draw_cands, i).uid;
+    G_Pos_SetInterpCandidates(s_gs.cull_cands.array, vec_size(&s_gs.draw_cands), g_frame_idx + 1);
+    s_last_ndraw = vec_size(&s_gs.draw_cands);
+    s_stage_us[2] = stage_us(st0);
+
+    if(s_gs.map) {
+        G_Region_Update();
+    }
+
+    G_Sel_Update(s_gs.active_cam, &s_gs.visible, &s_gs.visible_obbs);
+    P_Projectile_Update();
+    g_set_contextual_cursor();
+
+    PERF_PUSH("UI updates");
+    E_Global_NotifyImmediate(EVENT_UPDATE_UI, NULL, ES_ENGINE);
+    PERF_POP();
+
+    PERF_RETURN_VOID();
+}
+
+void G_StageTimes(uint32_t out[7])
+{
+    memcpy(out, s_stage_us, sizeof(s_stage_us));
+    memset(s_stage_us, 0, sizeof(s_stage_us));
+}
+
+void G_CullStats(int *out_ncands, int *out_nvis)
+{
+    *out_ncands = s_last_ndraw;
+    *out_nvis = vec_size(&s_gs.visible);
+}
+
+void G_UpdateMap(void)
+{
+    ASSERT_IN_MAIN_THREAD();
+    if(s_gs.map) {
+        M_Update(s_gs.map);
+    }
+}
+
+const struct map *G_GetMap(void)
+{
+    ASSERT_IN_MAIN_THREAD();
+    return s_gs.map;
+}
+
+void G_Render(void)
+{
+    PERF_ENTER();
+    ASSERT_IN_MAIN_THREAD();
+    ss_e status;
+    (void)status;
+
+    /* The chunk bakes render to their own target, so they precede the frame */
+    const int *terrain_layers = s_gs.map ? M_TerrainBake_Tick(s_gs.active_cam) : NULL;
+
+    R_PushCmd((struct rcmd){ R_GL_BeginFrame, 0 });
+    E_Global_NotifyImmediate(EVENT_RENDER_3D_PRE, NULL, ES_ENGINE);
+
+    uint64_t st0 = SDL_GetPerformanceCounter();
+    struct render_input in;
+    g_create_render_input(&in);
+    in.terrain_layers = terrain_layers;
+
+    struct render_input *rcopy = g_push_render_input(in);
+    s_stage_us[3] = stage_us(st0);
+    st0 = SDL_GetPerformanceCounter();
+    G_RenderMapAndEntities(rcopy);
+    s_stage_us[4] = stage_us(st0);
+
+    struct sval refract_setting;
+    status = Settings_Get("pf.video.water_refraction", &refract_setting);
+    assert(status == SS_OKAY);
+
+    struct sval reflect_setting;
+    status = Settings_Get("pf.video.water_reflection", &reflect_setting);
+    assert(status == SS_OKAY);
+
+    if(s_gs.map && M_WaterMaybeVisible(s_gs.map, s_gs.active_cam)) {
+
+        g_prune_water_input(&in);
+        struct render_input *water_rcopy = g_push_render_input(in);
+
+        R_PushCmd((struct rcmd){
+            .func = R_GL_DrawWater,
+            .nargs = 3,
+            .args = { 
+                water_rcopy,
+                R_PushArg(&refract_setting.as_bool, sizeof(bool)),
+                R_PushArg(&reflect_setting.as_bool, sizeof(bool)),
+            },
+        });
+    }
+    g_destroy_render_input();
+
+    enum selection_type sel_type;
+    const vec_entity_t *selected = G_Sel_Get(&sel_type);
+    for(int i = 0; i < vec_size(selected); i++) {
+
+        uint32_t curr = vec_AT(selected, i);
+        vec2_t curr_pos = G_Pos_GetXZ(curr);
+        const float width = 0.4f;
+        uint32_t flags = G_FlagsGet(curr);
+
+        if(flags & ENTITY_FLAG_BUILDING) {
+
+            struct obb obb;
+            Entity_CurrentOBB(curr, &obb, false);
+            R_PushCmd((struct rcmd){
+                .func = R_GL_DrawSelectionRectangle,
+                .nargs = 4,
+                .args = {
+                    R_PushArg(&obb, sizeof(obb)),
+                    R_PushArg(&width, sizeof(width)),
+                    R_PushArg(&g_seltype_color_map[sel_type], sizeof(g_seltype_color_map[0])),
+                    (void*)s_gs.prev_tick_map,
+                },
+            });
+        }else{
+
+            float sel_radius = G_GetSelectionRadius(curr);
+            R_PushCmd((struct rcmd){
+                .func = R_GL_DrawSelectionCircle,
+                .nargs = 5,
+                .args = {
+                    R_PushArg(&curr_pos, sizeof(curr_pos)),
+                    R_PushArg(&sel_radius, sizeof(sel_radius)),
+                    R_PushArg(&width, sizeof(width)),
+                    R_PushArg(&g_seltype_color_map[sel_type], sizeof(g_seltype_color_map[0])),
+                    (void*)s_gs.prev_tick_map,
+                },
+            });
+        }
+    }
+
+    /* A ring showing how far an ability reaches, while the player is asking. */
+    if(s_range_indicator.active && G_EntityExists(s_range_indicator.uid)) {
+
+        vec2_t pos = G_Pos_GetXZ(s_range_indicator.uid);
+        R_PushCmd((struct rcmd){
+            .func = R_GL_DrawSelectionCircle,
+            .nargs = 5,
+            .args = {
+                R_PushArg(&pos, sizeof(pos)),
+                R_PushArg(&s_range_indicator.radius, sizeof(s_range_indicator.radius)),
+                R_PushArg(&s_range_indicator.width, sizeof(s_range_indicator.width)),
+                R_PushArg(&s_range_indicator.color, sizeof(s_range_indicator.color)),
+                (void*)s_gs.prev_tick_map,
+            },
+        });
+    }
+
+    R_PushCmd((struct rcmd){
+        .func = R_GL_DrawSkybox,
+        .nargs = 1,
+        .args = {
+            R_PushArg(s_gs.active_cam, g_sizeof_camera)
+        }
+    });
+
+    E_Global_NotifyImmediate(EVENT_RENDER_3D_POST, NULL, ES_ENGINE);
+    R_PushCmd((struct rcmd) { R_GL_SetScreenspaceDrawMode, 0 });
+
+    st0 = SDL_GetPerformanceCounter();
+    if(!s_gs.hide_healthbars) {
+        g_render_healthbars();
+    }
+    s_stage_us[5] = stage_us(st0);
+
+    E_Global_NotifyImmediate(EVENT_RENDER_UI, NULL, ES_ENGINE);
+
+    st0 = SDL_GetPerformanceCounter();
+    if(s_gs.map) {
+        M_RenderMinimap(s_gs.map, s_gs.active_cam);
+        g_render_minimap_units();
+        R_PushCmd((struct rcmd){ R_GL_MapInvalidate, 0 });
+    }
+    s_stage_us[6] = stage_us(st0);
+
+    E_Global_NotifyImmediate(EVENT_RENDER_FINISH, NULL, ES_ENGINE);
+    R_PushCmd((struct rcmd){ R_GL_EndFrame, 0 });
+
+    PERF_RETURN_VOID();
+}
+
+void G_RenderMapAndEntities(struct render_input *in)
+{
+    PERF_ENTER();
+    if(in->shadows) {
+        g_shadow_pass(in);
+    }
+    g_draw_pass(in);
+    PERF_RETURN_VOID();
+}
+
+void G_FlagsSet(uint32_t uid, uint32_t flags)
+{
+    ASSERT_IN_MAIN_THREAD();
+
+    khiter_t k = kh_get(id, s_gs.ent_flag_map, uid);
+    if(k == kh_end(s_gs.ent_flag_map)) {
+        int status;
+        k = kh_put(id, s_gs.ent_flag_map, uid, &status);
+        assert(status != -1);
+    }
+    kh_value(s_gs.ent_flag_map, k) = flags;
+}
+
+uint32_t G_FlagsGet(uint32_t uid)
+{
+    khiter_t k = kh_get(id, s_gs.ent_flag_map, uid);
+    assert(k != kh_end(s_gs.ent_flag_map));
+    return kh_value(s_gs.ent_flag_map, k);
+}
+
+uint32_t G_FlagsGetFrom(khash_t(id) *table, uint32_t uid)
+{
+    khiter_t k = kh_get(id, table, uid);
+    assert(k != kh_end(table));
+    return kh_value(table, k);
+}
+
+khash_t(id) *G_FlagsCopyTable(void)
+{
+    return kh_copy_id(s_gs.ent_flag_map);
+}
+
+khash_t(id) *G_FlagsCopyTableInto(khash_t(id) *dst)
+{
+    return kh_copy_into_id(s_gs.ent_flag_map, dst);
+}
+
+bool G_AddEntity(uint32_t uid, uint32_t flags, vec3_t pos)
+{
+    ASSERT_IN_MAIN_THREAD();
+    assert(!(flags & ENTITY_FLAG_BUILDING) || !(flags & ENTITY_FLAG_BUILDER));
+
+    int ret;
+    khiter_t k;
+
+    k = kh_put(entity, s_gs.active, uid, &ret);
+    if(ret == -1 || ret == 0)
+        return false;
+
+    k = kh_put(id, s_gs.ent_faction_map, uid, &ret);
+    if(ret == -1 || ret == 0)
+        return false;
+    kh_value(s_gs.ent_faction_map, k) = 0;
+
+    k = kh_put(range, s_gs.ent_visrange_map, uid, &ret);
+    if(ret == -1 || ret == 0)
+        return false;
+    kh_value(s_gs.ent_visrange_map, k) = 0.0f;
+
+    k = kh_put(range, s_gs.selection_radiuses, uid, &ret);
+    if(ret == -1 || ret == 0)
+        return false;
+    kh_value(s_gs.selection_radiuses, k) = 0.0f;
+
+    G_FlagsSet(uid, flags);
+    G_Pos_Set(uid, pos);
+    G_UpdateReach(uid);
+
+    if(flags & ENTITY_FLAG_ANIMATED)
+        A_AddEntity(uid);
+
+    if(flags & ENTITY_FLAG_STORAGE_SITE)
+        G_StorageSite_AddEntity(uid);
+
+    if(flags & ENTITY_FLAG_BUILDING)
+        G_Building_AddEntity(uid);
+
+    if(flags & ENTITY_FLAG_BUILDER)
+        G_Builder_AddEntity(uid);
+
+    if(flags & ENTITY_FLAG_COMBATABLE)
+        G_Combat_AddEntity(uid, COMBAT_STANCE_AGGRESSIVE);
+
+    if(flags & ENTITY_FLAG_RESOURCE)
+        G_Resource_AddEntity(uid);
+
+    if(flags & ENTITY_FLAG_HARVESTER)
+        G_Harvester_AddEntity(uid);
+
+    if(flags & ENTITY_FLAG_GARRISON)
+        G_Garrison_AddGarrison(uid);
+
+    if(flags & ENTITY_FLAG_GARRISONABLE)
+        G_Garrison_AddGarrisonable(uid);
+
+    if(flags & ENTITY_FLAG_POPULATION)
+        G_Population_AddContributor(uid);
+
+    if(flags & ENTITY_FLAG_POPULATION_LIMIT)
+        G_Population_AddLimitContributor(uid);
+
+    if(flags & ENTITY_FLAG_MOVABLE) {
+    
+        k = kh_put(entity, s_gs.dynamic, uid, &ret);
+        assert(ret != -1 && ret != 0);
+
+        G_Move_AddEntity(uid, pos, 0.0f, 0);
+
+        uint32_t gpu_id = kh_size(s_gs.ent_gpu_id_map) + 1;
+        k = kh_put(id, s_gs.ent_gpu_id_map, uid, &ret);
+        assert(ret != -1 && ret != 0);
+        kh_value(s_gs.ent_gpu_id_map, k) = gpu_id;
+
+        k = kh_put(id, s_gs.gpu_id_ent_map, gpu_id, &ret);
+        assert(ret != -1 && ret != 0);
+        kh_value(s_gs.gpu_id_ent_map, k) = uid;
+
+        assert(kh_size(s_gs.dynamic) == kh_size(s_gs.ent_gpu_id_map));
+        assert(kh_size(s_gs.ent_gpu_id_map) == kh_size(s_gs.gpu_id_ent_map));
+
+        G_Formation_SetPreferred(uid, FORMATION_NONE);
+    }
+
+    if((flags & ENTITY_FLAG_MOVABLE)
+    || (flags & ENTITY_FLAG_COMBATABLE)
+    || (flags & ENTITY_FLAG_HARVESTER)
+    || (flags & ENTITY_FLAG_BUILDER)) {
+        G_Automation_AddEntity(uid);
+    }
+
+    return true;
+}
+
+bool G_RemoveEntity(uint32_t uid)
+{
+    ASSERT_IN_MAIN_THREAD();
+
+    khiter_t k = kh_get(entity, s_gs.active, uid);
+    if(k == kh_end(s_gs.active))
+        return false;
+    kh_del(entity, s_gs.active, k);
+
+    uint32_t flags = G_FlagsGet(uid);
+    if(flags & ENTITY_FLAG_MOVABLE)
+        g_delete_gpuid(uid);
+
+    int idx = vec_entity_indexof(&s_gs.visible, uid, g_entities_equal);
+    if(idx != -1) {
+        vec_entity_del(&s_gs.visible, idx);
+        vec_obb_del(&s_gs.visible_obbs, idx);
+    }
+
+    idx = vec_drawcand_indexof(&s_gs.draw_cands, (struct draw_cand){uid, 0},
+        g_draw_cands_equal);
+    if(idx != -1) {
+        vec_drawcand_del(&s_gs.draw_cands, idx);
+    }
+
+    A_RemoveEntity(uid);
+    G_Sel_Remove(uid);
+    G_Move_RemoveEntity(uid);
+    G_Formation_RemoveEntity(uid);
+    G_Combat_RemoveEntity(uid);
+    G_Building_RemoveEntity(uid);
+    G_Builder_RemoveEntity(uid);
+    G_Harvester_RemoveEntity(uid);
+    G_Resource_RemoveEntity(uid);
+    G_StorageSite_RemoveEntity(uid);
+    G_Garrison_RemoveGarrison(uid);
+    G_Garrison_RemoveGarrisonable(uid);
+    G_Population_RemoveContributor(uid);
+    G_Population_RemoveLimitContributor(uid);
+    G_Automation_RemoveEntity(uid);
+    G_Group_RemoveEntity(uid);
+    G_Pos_SyncRefs(uid);
+    G_Region_RemoveEnt(uid);
+    G_Pos_Delete(uid);
+    Entity_Remove(uid);
+
+    k = kh_get(id, s_gs.ent_faction_map, uid);
+    assert(k != kh_end(s_gs.ent_faction_map));
+    kh_del(id, s_gs.ent_faction_map, k);
+
+    k = kh_get(range, s_gs.ent_visrange_map, uid);
+    assert(k != kh_end(s_gs.ent_visrange_map));
+    kh_del(range, s_gs.ent_visrange_map, k);
+
+    k = kh_get(range, s_gs.selection_radiuses, uid);
+    assert(k != kh_end(s_gs.selection_radiuses));
+    kh_del(range, s_gs.selection_radiuses, k);
+
+    G_Sel_MarkHoveredDirty();
+    return true;
+}
+
+void G_StopEntity(uint32_t uid, bool stop_move, bool stop_garrison)
+{
+    ASSERT_IN_MAIN_THREAD();
+    uint32_t flags = G_FlagsGet(uid);
+
+    if(flags & ENTITY_FLAG_COMBATABLE) {
+        G_Combat_StopAttack(uid);
+        G_Combat_SetStance(uid, COMBAT_STANCE_AGGRESSIVE);
+    }
+    if(flags & ENTITY_FLAG_HARVESTER) {
+        G_Harvester_Stop(uid);
+        G_Harvester_ClearQueuedCmd(uid);
+    }
+    if(stop_move && (flags & ENTITY_FLAG_MOVABLE)) {
+        G_Move_Stop(uid);
+    }
+    if(flags & ENTITY_FLAG_BUILDER) {
+        G_Builder_Stop(uid);
+    }
+    if(stop_garrison && ((flags & ENTITY_FLAG_GARRISON) || (flags & ENTITY_FLAG_GARRISONABLE))) {
+        G_Garrison_Stop(uid);
+    }
+
+    E_Entity_Notify(EVENT_ENTITY_STOP, uid, NULL, ES_ENGINE);
+}
+
+void G_DeferredRemove(uint32_t uid)
+{
+    ASSERT_IN_MAIN_THREAD();
+    vec_entity_push(&s_gs.removed, uid);
+}
+
+void G_FreeEntity(uint32_t uid)
+{
+    ASSERT_IN_MAIN_THREAD();
+    AL_EntityFree(uid);
+}
+
+uint32_t G_GPUIDForEnt(uint32_t uid)
+{
+    ASSERT_IN_MAIN_THREAD();
+    khiter_t k = kh_get(id, s_gs.ent_gpu_id_map, uid);
+    if(k == kh_end(s_gs.ent_gpu_id_map))
+        return 0;
+    return kh_value(s_gs.ent_gpu_id_map, k);
+}
+
+uint32_t G_GPUIDForEntFrom(khash_t(id) *table, uint32_t uid)
+{
+    khiter_t k = kh_get(id, table, uid);
+    if(k == kh_end(table))
+        return 0;
+    return kh_value(table, k);
+}
+
+uint32_t G_EntForGPUID(uint32_t gpuid)
+{
+    ASSERT_IN_MAIN_THREAD();
+    assert(gpuid >= 1 && gpuid <= kh_size(G_GetDynamicEntsSet()));
+    khiter_t k = kh_get(id, s_gs.gpu_id_ent_map, gpuid);
+    assert(k != kh_end(s_gs.gpu_id_ent_map));
+    return kh_value(s_gs.gpu_id_ent_map, k);
+}
+
+uint32_t G_EntForGPUIDFrom(khash_t(id) *table, uint32_t gpuid)
+{
+    assert(gpuid >= 1 && gpuid <= kh_size(table));
+    khiter_t k = kh_get(id, table, gpuid);
+    assert(k != kh_end(table));
+    return kh_value(table, k);
+}
+
+khash_t(id) *G_CopyEntGPUIDMap(void)
+{
+    return kh_copy(id, s_gs.ent_gpu_id_map);
+}
+
+khash_t(id) *G_CopyEntGPUIDMapInto(khash_t(id) *dst)
+{
+    return kh_copy_into(id, s_gs.ent_gpu_id_map, dst);
+}
+
+khash_t(id) *G_CopyGPUIDEntMap(void)
+{
+    return kh_copy(id, s_gs.gpu_id_ent_map);
+}
+
+khash_t(id) *G_CopyGPUIDEntMapInto(khash_t(id) *dst)
+{
+    return kh_copy_into(id, s_gs.gpu_id_ent_map, dst);
+}
+
+bool G_AddFaction(const char *name, vec3_t color, int *out_id)
+{
+    ASSERT_IN_MAIN_THREAD();
+
+    if(g_num_factions() == MAX_FACTIONS)
+        return false;
+    if(strlen(name) >= sizeof(s_gs.factions[0].name))
+        return false;
+
+    int new_fac_id = g_alloc_faction();
+    strcpy(s_gs.factions[new_fac_id].name, name);
+    s_gs.factions[new_fac_id].color = color;
+    s_gs.factions[new_fac_id].controllable = true;
+
+    /* By default, a new faction is mutually at peace with 
+     * every other faction. */
+    for(int i = 0; i < MAX_FACTIONS; i++) {
+        if(!(s_gs.factions_allocd & (0x1 << i)))
+            continue;
+        s_gs.diplomacy_table[i][new_fac_id] = DIPLOMACY_STATE_PEACE;
+        s_gs.diplomacy_table[new_fac_id][i] = DIPLOMACY_STATE_PEACE;
+    }
+
+    E_Global_Notify(EVENT_UPDATE_FACTION, (void*)((uintptr_t)new_fac_id), ES_ENGINE);
+    if(out_id) {
+        *out_id = new_fac_id;
+    }
+    return true;
+}
+
+bool G_RemoveFaction(int faction_id)
+{
+    ASSERT_IN_MAIN_THREAD();
+
+    if(!(s_gs.factions_allocd & (0x1 << faction_id)))
+        return false;
+
+    uint32_t key, curr;
+
+    kh_foreach(s_gs.active, key, curr, {
+        if(G_GetFactionID(key) == faction_id)
+            G_Zombiefy(curr, true);
+    });
+
+    s_gs.factions_allocd &= ~(0x1 << faction_id);
+    E_Global_Notify(EVENT_UPDATE_FACTION, (void*)((uintptr_t)faction_id), ES_ENGINE);
+    return true;
+}
+
+bool G_UpdateFaction(int faction_id, const char *name, vec3_t color, bool control)
+{
+    ASSERT_IN_MAIN_THREAD();
+
+    if(!(s_gs.factions_allocd & (0x1 << faction_id)))
+        return false;
+    if(strlen(name) >= sizeof(s_gs.factions[0].name))
+        return false;
+
+    if(s_gs.factions[faction_id].controllable != control) {
+        G_Fog_ClearExploredCache();
+    }
+
+    pf_strlcpy(s_gs.factions[faction_id].name, name, sizeof(s_gs.factions[0].name));
+    s_gs.factions[faction_id].color = color;
+    s_gs.factions[faction_id].controllable = control;
+    E_Global_Notify(EVENT_UPDATE_FACTION, (void*)((uintptr_t)faction_id), ES_ENGINE);
+    return true;
+}
+
+uint16_t G_GetFactions(char out_names[][MAX_FAC_NAME_LEN], vec3_t *out_colors, bool *out_ctrl)
+{
+    ASSERT_IN_MAIN_THREAD();
+
+    for(int i = 0; i < MAX_FACTIONS; i++) {
+
+        if(!(s_gs.factions_allocd & (0x1 << i)))
+            continue;
+    
+        if(out_names) {
+            pf_strlcpy(out_names[i], s_gs.factions[i].name, MAX_FAC_NAME_LEN);
+        }
+        if(out_colors) {
+            out_colors[i] = s_gs.factions[i].color;
+        }
+        if(out_ctrl) {
+            out_ctrl[i] = s_gs.factions[i].controllable;
+        }
+    }
+    return s_gs.factions_allocd;
+}
+
+uint16_t G_GetPlayerControlledFactions(void)
+{
+    uint16_t ret = 0;
+
+    for(int i = 0; i < MAX_FACTIONS; i++) {
+        if(!(s_gs.factions_allocd & (0x1 << i)))
+            continue;
+        if(!s_gs.factions[i].controllable)
+            continue;
+        ret |= (0x1 << i);
+    }
+    return ret;
+}
+
+uint16_t G_GetEnemyFactions(int faction_id)
+{
+    uint16_t ret = 0;
+
+    for(int i = 0; i < MAX_FACTIONS; i++) {
+
+        enum diplomacy_state ds;
+        if(!G_GetDiplomacyState(i, faction_id, &ds))
+            continue;
+        if(ds != DIPLOMACY_STATE_WAR)
+            continue;
+        ret |= (0x1 << i);
+    }
+    return ret;
+}
+
+void G_SetFactionID(uint32_t uid, int faction_id)
+{
+    ASSERT_IN_MAIN_THREAD();
+
+    int old = G_GetFactionID(uid);
+    if(old == faction_id)
+        return;
+
+    khiter_t k = kh_get(id, s_gs.ent_faction_map, uid);
+    assert(k != kh_end(s_gs.ent_faction_map));
+    kh_value(s_gs.ent_faction_map, k) = faction_id;
+
+    G_Pos_SyncRefs(uid);
+    vec2_t xz_pos = G_Pos_GetXZ(uid);
+    float vrange = G_GetVisionRange(uid);
+
+    G_Fog_RemoveVision(xz_pos, old, vrange);
+    G_Fog_AddVision(xz_pos, faction_id, vrange);
+
+    G_Combat_UpdateRef(old, faction_id, xz_pos);
+    G_Move_UpdateFactionID(uid, old, faction_id);
+    G_StorageSite_UpdateFaction(uid, old, faction_id);
+    G_Resource_UpdateFactionID(uid, old, faction_id);
+    G_Building_UpdateFactionID(uid, old, faction_id);
+    G_Population_UpdateFaction(uid, old, faction_id);
+}
+
+int G_GetFactionID(uint32_t uid)
+{
+    khiter_t k = kh_get(id, s_gs.ent_faction_map, uid);
+    assert(k != kh_end(s_gs.ent_faction_map));
+    return kh_value(s_gs.ent_faction_map, k);
+}
+
+khash_t(id) *G_FactionIDCopyTable(void)
+{
+    return kh_copy_id(s_gs.ent_faction_map);
+}
+
+khash_t(id) *G_FactionIDCopyTableInto(khash_t(id) *dst)
+{
+    return kh_copy_into_id(s_gs.ent_faction_map, dst);
+}
+
+int G_GetFactionIDFrom(khash_t(id) *table, uint32_t uid)
+{
+    khiter_t k = kh_get(id, table, uid);
+    assert(k != kh_end(table));
+    return kh_value(table, k);
+}
+
+void G_GetFieldCacheStats(struct fc_stats *out)
+{
+    ASSERT_IN_MAIN_THREAD();
+    if(!s_gs.map) {
+        memset(out, 0, sizeof(struct fc_stats));
+        return;
+    }
+    M_GetFieldCacheStats(s_gs.map, out);
+}
+
+void G_SetVisionRange(uint32_t uid, float range)
+{
+    ASSERT_IN_MAIN_THREAD();
+
+    khiter_t k = kh_get(range, s_gs.ent_visrange_map, uid);
+    assert(k != kh_end(s_gs.ent_visrange_map));
+
+    float oldrange = kh_value(s_gs.ent_visrange_map, k);
+    G_Pos_SyncRefs(uid);
+    vec2_t xz_pos = G_Pos_GetXZ(uid);
+
+    G_Fog_UpdateVisionRange(xz_pos, G_GetFactionID(uid), oldrange, range);
+    kh_value(s_gs.ent_visrange_map, k) = range;
+}
+
+float G_GetVisionRange(uint32_t uid)
+{
+    ASSERT_IN_MAIN_THREAD();
+
+    khiter_t k = kh_get(range, s_gs.ent_visrange_map, uid);
+    assert(k != kh_end(s_gs.ent_visrange_map));
+    return kh_value(s_gs.ent_visrange_map, k);
+}
+
+void G_ReseedFogVision(void)
+{
+    ASSERT_IN_MAIN_THREAD();
+    G_Fog_ClearVisionState();
+
+    uint32_t uid;
+    float range;
+    kh_foreach(s_gs.ent_visrange_map, uid, range, {
+        if(range == 0.0f)
+            continue;
+        G_Fog_AddVision(G_Pos_GetXZ(uid), G_GetFactionID(uid), range);
+    });
+}
+
+void G_SetRangeIndicator(uint32_t uid, float radius, vec3_t color, float width)
+{
+    ASSERT_IN_MAIN_THREAD();
+
+    s_range_indicator.active = true;
+    s_range_indicator.uid = uid;
+    s_range_indicator.radius = radius;
+    s_range_indicator.color = color;
+    s_range_indicator.width = width;
+}
+
+void G_ClearRangeIndicator(void)
+{
+    ASSERT_IN_MAIN_THREAD();
+    s_range_indicator.active = false;
+}
+
+void G_SetSelectionRadius(uint32_t uid, float range)
+{
+    ASSERT_IN_MAIN_THREAD();
+
+    khiter_t k = kh_get(range, s_gs.selection_radiuses, uid);
+    assert(k != kh_end(s_gs.selection_radiuses));
+
+    G_Move_UpdateSelectionRadius(uid, range);
+    G_Resource_UpdateSelectionRadius(uid, range);
+    kh_value(s_gs.selection_radiuses, k) = range;
+}
+
+float G_GetSelectionRadius(uint32_t uid)
+{
+    khiter_t k = kh_get(range, s_gs.selection_radiuses, uid);
+    assert(k != kh_end(s_gs.selection_radiuses));
+    return kh_value(s_gs.selection_radiuses, k);
+}
+
+khash_t(range) *G_SelectionRadiusCopyTable(void)
+{
+    return kh_copy_range(s_gs.selection_radiuses);
+}
+
+khash_t(range) *G_SelectionRadiusCopyTableInto(khash_t(range) *dst)
+{
+    return kh_copy_into_range(s_gs.selection_radiuses, dst);
+}
+
+float G_GetSelectionRadiusFrom(khash_t(range) *table, uint32_t uid)
+{
+    khiter_t k = kh_get(range, table, uid);
+    assert(k != kh_end(table));
+    return kh_value(table, k);
+}
+
+bool G_SetDiplomacyState(int fac_id_a, int fac_id_b, enum diplomacy_state ds)
+{
+    ASSERT_IN_MAIN_THREAD();
+
+    if(!(s_gs.factions_allocd & (0x1 << fac_id_a)))
+        return false;
+    if(!(s_gs.factions_allocd & (0x1 << fac_id_b)))
+        return false;
+    if(fac_id_a == fac_id_b)
+        return false;
+
+    s_gs.diplomacy_table[fac_id_a][fac_id_b] = ds;
+    s_gs.diplomacy_table[fac_id_b][fac_id_a] = ds;
+    return true;
+}
+
+bool G_GetDiplomacyState(int fac_id_a, int fac_id_b, enum diplomacy_state *out)
+{
+    if(!(s_gs.factions_allocd & (0x1 << fac_id_a)))
+        return false;
+    if(!(s_gs.factions_allocd & (0x1 << fac_id_b)))
+        return false;
+    if(fac_id_a == fac_id_b)
+        return false;
+
+    *out = s_gs.diplomacy_table[fac_id_a][fac_id_b];
+    return true;
+}
+
+enum diplomacy_state (*G_CopyDiplomacyTable(void))[MAX_FACTIONS]
+{
+    void *ret = PF_MALLOC(sizeof(s_gs.diplomacy_table));
+    if(!ret)
+        return NULL;
+    memcpy(ret, s_gs.diplomacy_table, sizeof(s_gs.diplomacy_table));
+    return ret;
+}
+
+bool G_GetDiplomacyStateFrom(enum diplomacy_state (*table)[MAX_FACTIONS],
+                             int fac_id_a, int fac_id_b, enum diplomacy_state *out)
+{
+    if(fac_id_a == fac_id_b)
+        return false;
+
+    *out = table[fac_id_a][fac_id_b];
+    return true;
+}
+
+void G_SetActiveCamera(struct camera *cam, enum cam_mode mode)
+{
+    ASSERT_IN_MAIN_THREAD();
+
+    M_Raycast_Uninstall();
+
+    switch(mode) {
+    case CAM_MODE_RTS:  
+
+        CamControl_RTS_Install(cam);
+        if(s_gs.map) {
+            M_RestrictRTSCamToMap(s_gs.map, cam);
+        }
+        break;
+
+    case CAM_MODE_FPS:  
+
+        CamControl_FPS_Install(cam);
+        break;
+
+    case CAM_MODE_FREE: 
+
+        CamControl_Free_Install(cam);
+        break;
+
+    default: assert(0);
+    }
+
+    s_gs.active_cam = cam;
+    s_gs.active_cam_mode = mode;
+
+    if(s_gs.map) {
+        M_Raycast_Install(s_gs.map, cam);
+    }
+}
+
+struct camera *G_GetActiveCamera(void)
+{
+    ASSERT_IN_MAIN_THREAD();
+    return s_gs.active_cam;
+}
+
+enum cam_mode G_GetCameraMode(void)
+{
+    ASSERT_IN_MAIN_THREAD();
+    return s_gs.active_cam_mode;
+}
+
+void G_MoveActiveCamera(vec2_t xz_ground_pos)
+{
+    ASSERT_IN_MAIN_THREAD();
+
+    vec3_t old_pos = Camera_GetPos(s_gs.active_cam);
+    float offset_mag = cos(DEG_TO_RAD(Camera_GetPitch(s_gs.active_cam))) * Camera_GetHeight(s_gs.active_cam);
+
+    /* We position the camera such that the camera ray intersects the ground plane (Y=0)
+     * at the specified xz position. */
+    vec3_t new_pos = (vec3_t) {
+        xz_ground_pos.x - cos(DEG_TO_RAD(Camera_GetYaw(s_gs.active_cam))) * offset_mag,
+        old_pos.y,
+        xz_ground_pos.z + sin(DEG_TO_RAD(Camera_GetYaw(s_gs.active_cam))) * offset_mag 
+    };
+
+    Camera_SetPos(s_gs.active_cam, new_pos);
+}
+
+bool G_UpdateTile(const struct tile_desc *desc, const struct tile *tile)
+{
+    ASSERT_IN_MAIN_THREAD();
+
+    if(!s_gs.map)
+        return false;
+    if(!M_AL_UpdateTile(s_gs.map, desc, tile))
+        return false;
+    M_FoliageUpdateTile(*desc);
+    G_Fog_OnTileUpdated(desc->chunk_r, desc->chunk_c);
+    return true;
+}
+
+bool G_GetTile(const struct tile_desc *desc, struct tile *out)
+{
+    ASSERT_IN_MAIN_THREAD();
+
+    if(!s_gs.map)
+        return false;
+
+    struct tile *tile;
+    if(!M_TileForDesc(s_gs.map, *desc, &tile))
+        return false;
+    *out = *tile;
+    return true;
+}
+
+const khash_t(entity) *G_GetDynamicEntsSet(void)
+{
+    ASSERT_IN_MAIN_THREAD();
+
+    return s_gs.dynamic;
+}
+
+const khash_t(entity) *G_GetAllEntsSet(void)
+{
+    return s_gs.active;
+}
+
+void G_SetSimState(enum simstate ss)
+{
+    ASSERT_IN_MAIN_THREAD();
+
+    /* Only change the simulation states at frame boundaries. This has some nice 
+     * guarantees, such as that all handlers for a particular event will run, even
+     * if some handler requests a change of the simulation state state midway. 
+     */
+    s_gs.requested_ss = ss;
+}
+
+void G_UpdateSimStateChangeTick(void)
+{
+    ASSERT_IN_MAIN_THREAD();
+    s_gs.ss_change_tick = SDL_GetTicks();
+}
+
+void G_SetLightPos(vec3_t pos)
+{
+    ASSERT_IN_MAIN_THREAD();
+
+    s_gs.light_pos = pos;
+    M_TerrainBake_OnLightChanged(s_gs.light_pos, s_gs.ambient_light_color, s_gs.emit_light_color);
+    R_PushCmd((struct rcmd){
+        .func = R_GL_SetLightPos,
+        .nargs = 1,
+        .args = { R_PushArg(&pos, sizeof(pos)) },
+    });
+}
+
+void G_SetAmbientLightColor(vec3_t color)
+{
+    ASSERT_IN_MAIN_THREAD();
+
+    s_gs.ambient_light_color = color;
+    M_TerrainBake_OnLightChanged(s_gs.light_pos, s_gs.ambient_light_color, s_gs.emit_light_color);
+    R_PushCmd((struct rcmd){
+        .func = R_GL_SetAmbientLightColor,
+        .nargs = 1,
+        .args = { R_PushArg(&color, sizeof(color)) },
+    });
+}
+
+vec3_t G_GetAmbientLightColor(void)
+{
+    ASSERT_IN_MAIN_THREAD();
+    return s_gs.ambient_light_color;
+}
+
+void G_SetEmitLightColor(vec3_t color)
+{
+    ASSERT_IN_MAIN_THREAD();
+
+    s_gs.emit_light_color = color;
+    M_TerrainBake_OnLightChanged(s_gs.light_pos, s_gs.ambient_light_color, s_gs.emit_light_color);
+    R_PushCmd((struct rcmd){
+        .func = R_GL_SetLightEmitColor,
+        .nargs = 1,
+        .args = { R_PushArg(&color, sizeof(color)) },
+    });
+}
+
+vec3_t G_GetEmitLightColor(void)
+{
+    ASSERT_IN_MAIN_THREAD();
+    return s_gs.emit_light_color;
+}
+
+void G_SetSkybox(const char *dir, const char *extension)
+{
+    ASSERT_IN_MAIN_THREAD();
+
+    pf_strlcpy(s_gs.skybox_directory, dir, sizeof(s_gs.skybox_directory));
+    pf_strlcpy(s_gs.skybox_extension, extension, sizeof(s_gs.skybox_extension));
+
+    R_PushCmd((struct rcmd){
+        .func = R_GL_SkyboxFree,
+        .nargs = 0,
+        .args = {0}
+    });
+    R_PushCmd((struct rcmd){
+        .func = R_GL_SkyboxLoad,
+        .nargs = 2,
+        .args = {
+            R_PushArg(dir, strlen(dir)),
+            R_PushArg(extension, strlen(extension)),
+        }
+    });
+}
+
+void G_GetSkybox(const char **dir, const char **extension)
+{
+    ASSERT_IN_MAIN_THREAD();
+    *dir = s_gs.skybox_directory;
+    *extension = s_gs.skybox_extension;
+}
+
+vec3_t G_GetLightPos(void)
+{
+    ASSERT_IN_MAIN_THREAD();
+    return s_gs.light_pos;
+}
+
+enum simstate G_GetSimState(void)
+{
+    ASSERT_IN_MAIN_THREAD();
+
+    return s_gs.ss;
+}
+
+void G_Zombiefy(uint32_t uid, bool invis)
+{
+    ASSERT_IN_MAIN_THREAD();
+    uint32_t flags = G_FlagsGet(uid);
+
+    if(flags & ENTITY_FLAG_SELECTABLE)
+        G_Sel_Remove(uid);
+
+    if(flags & ENTITY_FLAG_MOVABLE)
+        g_delete_gpuid(uid);
+
+    G_Move_RemoveEntity(uid);
+    G_Formation_RemoveEntity(uid);
+    G_Combat_RemoveEntity(uid);
+    G_Building_RemoveEntity(uid);
+    G_Builder_RemoveEntity(uid);
+    G_Harvester_RemoveEntity(uid);
+    G_Resource_RemoveEntity(uid);
+    G_StorageSite_RemoveEntity(uid);
+    G_Garrison_RemoveGarrison(uid);
+    G_Garrison_RemoveGarrisonable(uid);
+    G_Population_RemoveContributor(uid);
+    G_Population_RemoveLimitContributor(uid);
+    G_Automation_RemoveEntity(uid);
+    G_Group_RemoveEntity(uid);
+
+    G_Pos_SyncRefs(uid);
+    G_SetVisionRange(uid, 0.0f);
+    G_Region_RemoveEnt(uid);
+    Entity_ClearTags(uid);
+    Entity_ClearIcons(uid);
+
+    flags &= ~ENTITY_FLAG_SELECTABLE;
+    flags &= ~ENTITY_FLAG_COLLISION;
+    flags &= ~ENTITY_FLAG_COMBATABLE;
+    flags &= ~ENTITY_FLAG_BUILDING;
+    flags &= ~ENTITY_FLAG_MOVABLE;
+    flags &= ~ENTITY_FLAG_BUILDER;
+    flags &= ~ENTITY_FLAG_HARVESTER;
+    flags &= ~ENTITY_FLAG_RESOURCE;
+    flags &= ~ENTITY_FLAG_STORAGE_SITE;
+    flags &= ~ENTITY_FLAG_GARRISON;
+    flags &= ~ENTITY_FLAG_GARRISONABLE;
+    flags &= ~ENTITY_FLAG_GARRISONED;
+    flags &= ~ENTITY_FLAG_POPULATION;
+    flags &= ~ENTITY_FLAG_POPULATION_LIMIT;
+
+    flags |= ENTITY_FLAG_ZOMBIE;
+
+    if(invis) {
+        flags |= ENTITY_FLAG_INVISIBLE;
+    }
+    G_FlagsSet(uid, flags);
+}
+
+bool G_EntityExists(uint32_t uid)
+{
+    khiter_t k = kh_get(entity, s_gs.active, uid);
+    return (k != kh_end(s_gs.active));
+}
+
+bool G_EntityIsZombie(uint32_t uid)
+{
+    ASSERT_IN_MAIN_THREAD();
+    if(!G_EntityExists(uid))
+        return false;
+    return (G_FlagsGet(uid) & ENTITY_FLAG_ZOMBIE);
+}
+
+bool G_EntityIsGarrisoned(uint32_t uid)
+{
+    ASSERT_IN_MAIN_THREAD();
+    if(!G_EntityExists(uid))
+        return false;
+    return (G_FlagsGet(uid) & ENTITY_FLAG_GARRISONED);
+}
+
+struct render_workspace *G_GetSimWS(void)
+{
+    ASSERT_IN_MAIN_THREAD();
+
+    return &s_gs.ws[s_gs.curr_ws_idx];
+}
+
+struct render_workspace *G_GetRenderWS(void)
+{
+    return &s_gs.ws[(s_gs.curr_ws_idx + 1) % 2];
+}
+
+void G_SwapBuffers(void)
+{
+    ASSERT_IN_MAIN_THREAD();
+
+    int sim_idx = s_gs.curr_ws_idx;
+    int render_idx = (sim_idx + 1) % 2;
+
+    if(s_gs.map) {
+        M_AL_ShallowCopyDirty((struct map*)s_gs.prev_tick_map, s_gs.map);
+    }
+
+    g_remove_queued();
+    R_ClearWS(&s_gs.ws[render_idx]);
+    s_gs.curr_ws_idx = render_idx;
+
+    g_change_simstate();
+}
+
+bool G_MapLoaded(void)
+{
+    ASSERT_IN_MAIN_THREAD();
+    return (s_gs.map != NULL);
+}
+
+const struct map *G_GetPrevTickMap(void)
+{
+    ASSERT_IN_MAIN_THREAD();
+    return s_gs.prev_tick_map;
+}
+
+bool G_MouseInTargetMode(void)
+{
+    ASSERT_IN_MAIN_THREAD();
+
+    if(G_Move_InTargetMode())
+        return true;
+    if(G_Builder_InTargetMode())
+        return true;
+    if(G_Harvester_InTargetMode())
+        return true;
+    if(G_Garrison_InTargetMode())
+        return true;
+    if(G_Building_InTargetMode())
+        return true;
+    return false;
+}
+
+enum ctx_action G_CurrContextualAction(void)
+{
+    ASSERT_IN_MAIN_THREAD();
+
+    int action;
+    if((action = G_Builder_CurrContextualAction()) != CTX_ACTION_NONE)
+        return action;
+    if((action = G_Harvester_CurrContextualAction()) != CTX_ACTION_NONE)
+        return action;
+    if((action = G_Combat_CurrContextualAction()) != CTX_ACTION_NONE)
+        return action;
+    if((action = G_Garrison_CurrContextualAction()) != CTX_ACTION_NONE)
+        return action;
+    return CTX_ACTION_NONE;
+}
+
+void G_NotifyOrderIssued(uint32_t uid, bool clear_harvester)
+{
+    ASSERT_IN_MAIN_THREAD();
+
+    uint32_t flags = G_FlagsGet(uid);
+    if(clear_harvester && (flags & ENTITY_FLAG_HARVESTER)) {
+        G_Harvester_ClearQueuedCmd(uid);
+    }
+    if(flags & ENTITY_FLAG_COMBATABLE) {
+        G_Combat_ClearSavedMoveCmd(uid);
+    }
+    E_Global_Notify(EVENT_ORDER_ISSUED, (void*)(uintptr_t)uid, ES_ENGINE);
+}
+
+void G_SetHideHealthbars(bool on)
+{
+    ASSERT_IN_MAIN_THREAD();
+    s_gs.hide_healthbars = on;
+}
+
+void G_UpdateReach(uint32_t uid)
+{
+    ASSERT_IN_MAIN_THREAD();
+
+    if(!G_EntityExists(uid))
+        return;
+    G_Pos_SetReach(uid, Entity_MaxReach(uid));
+}
+
+void G_UpdateBounds(uint32_t uid)
+{
+    ASSERT_IN_MAIN_THREAD();
+
+    if(!G_EntityExists(uid))
+        return;
+
+    /* Both updates are no-ops for plain units; one flags probe replaces two
+     * module-table probes on the per-moving-entity rotation path.
+     */
+    uint32_t flags = G_FlagsGet(uid);
+    if(flags & ENTITY_FLAG_BUILDING)
+        G_Building_UpdateBounds(uid);
+    if(flags & ENTITY_FLAG_RESOURCE)
+        G_Resource_UpdateBounds(uid);
+}
+
+void G_SetShowUnitIcons(bool show)
+{
+    s_gs.show_unit_icons = show;
+}
+
+bool G_GetShowUnitIcons(void)
+{
+    return s_gs.show_unit_icons;
+}
+
+void G_SetAttackOnRightClick(bool on)
+{
+    s_gs.attack_on_rclick = on;
+}
+
+bool G_GetAttackOnRightClick(void)
+{
+    return s_gs.attack_on_rclick;
+}
+
+bool G_SaveGlobalState(SDL_RWops *stream)
+{
+    ASSERT_IN_MAIN_THREAD();
+
+    struct attr hasmap = (struct attr){
+        .type = TYPE_BOOL, 
+        .val.as_bool = (s_gs.map != NULL)
+    };
+    CHK_TRUE_RET(Attr_Write(stream, &hasmap, "has_map"));
+
+    if(hasmap.val.as_bool && !M_AL_WritePFMap(s_gs.map, stream))
+        return false;
+
+    if(hasmap.val.as_bool) {
+    
+        vec2_t mm_pos;
+        G_GetMinimapPos(&mm_pos.x, &mm_pos.y);
+
+        struct attr minimap_pos = (struct attr){
+            .type = TYPE_VEC2, 
+            .val.as_vec2 = mm_pos
+        };
+        CHK_TRUE_RET(Attr_Write(stream, &minimap_pos, "minimap_pos"));
+
+        struct attr minimap_border_clr = (struct attr){
+            .type = TYPE_QUAT, 
+            .val.as_quat = M_MinimapGetBorderClr()
+        };
+        CHK_TRUE_RET(Attr_Write(stream, &minimap_border_clr, "minimap_border_clr"));
+
+        int mm_size = 0;
+        G_GetMinimapSize(&mm_size);
+        struct attr minimap_size = (struct attr){
+            .type = TYPE_INT, 
+            .val.as_int = mm_size
+        };
+        CHK_TRUE_RET(Attr_Write(stream, &minimap_size, "minimap_size"));
+
+        struct attr highlight_size = (struct attr){
+            .type = TYPE_INT, 
+            .val.as_int = M_Raycast_GetHighlightSize()
+        };
+        CHK_TRUE_RET(Attr_Write(stream, &highlight_size, "highlight_size"));
+
+        CHK_TRUE_RET(G_Fog_SaveState(stream));
+    }
+
+    Sched_TryYield();
+
+    struct attr ss = (struct attr){
+        .type = TYPE_INT, 
+        .val.as_int = s_gs.ss
+    };
+    CHK_TRUE_RET(Attr_Write(stream, &ss, "simstate"));
+
+    struct attr light_pos = (struct attr){
+        .type = TYPE_VEC3, 
+        .val.as_vec3 = s_gs.light_pos
+    };
+    CHK_TRUE_RET(Attr_Write(stream, &light_pos, "light_pos"));
+
+    struct attr ambient_light_color = (struct attr){
+        .type = TYPE_VEC3, 
+        .val.as_vec3 = s_gs.ambient_light_color
+    };
+    CHK_TRUE_RET(Attr_Write(stream, &ambient_light_color, "ambient_light_color"));
+
+    struct attr emit_light_color = (struct attr){
+        .type = TYPE_VEC3, 
+        .val.as_vec3 = s_gs.emit_light_color
+    };
+    CHK_TRUE_RET(Attr_Write(stream, &emit_light_color, "emit_light_color"));
+
+    struct attr skybox_directory = (struct attr){ .type = TYPE_STRING, };
+    pf_snprintf(skybox_directory.val.as_string, sizeof(skybox_directory.val.as_string), 
+        "%s", s_gs.skybox_directory);
+    CHK_TRUE_RET(Attr_Write(stream, &skybox_directory, "skybox_directory"));
+
+    struct attr skybox_extension = (struct attr){ .type = TYPE_STRING, };
+    pf_snprintf(skybox_extension.val.as_string, sizeof(skybox_extension.val.as_string), 
+        "%s", s_gs.skybox_extension);
+    CHK_TRUE_RET(Attr_Write(stream, &skybox_extension, "skybox_extension"));
+
+    struct attr num_factions = (struct attr){
+        .type = TYPE_INT, 
+        .val.as_int = g_num_factions()
+    };
+    CHK_TRUE_RET(Attr_Write(stream, &num_factions, "num_factions"));
+
+    Sched_TryYield();
+
+    for(int i = 0; i < MAX_FACTIONS; i++) {
+
+        if(!(s_gs.factions_allocd & (0x1 << i)))
+            continue;
+        struct faction fac = s_gs.factions[i];
+
+        struct attr fac_id = (struct attr){
+            .type = TYPE_INT, 
+            .val.as_int = i
+        };
+        CHK_TRUE_RET(Attr_Write(stream, &fac_id, "fac_id"));
+
+        struct attr fac_color = (struct attr){
+            .type = TYPE_VEC3, 
+            .val.as_vec3 = fac.color
+        };
+        CHK_TRUE_RET(Attr_Write(stream, &fac_color, "fac_color"));
+
+        struct attr fac_name = (struct attr){ .type = TYPE_STRING };
+        pf_snprintf(fac_name.val.as_string, sizeof(fac_name.val.as_string), "%s", fac.name);
+        CHK_TRUE_RET(Attr_Write(stream, &fac_name, "fac_name"));
+
+        struct attr fac_controllable = (struct attr){
+            .type = TYPE_BOOL,
+            .val.as_bool = fac.controllable
+        };
+        CHK_TRUE_RET(Attr_Write(stream, &fac_controllable, "fac_controllable"));
+        Sched_TryYield();
+    }
+
+    for(int i = 0; i < MAX_FACTIONS; i++) {
+    for(int j = 0; j < MAX_FACTIONS; j++) {
+
+        struct attr dstate = (struct attr){
+            .type = TYPE_INT,
+            .val.as_int = s_gs.diplomacy_table[i][j]
+        };
+        CHK_TRUE_RET(Attr_Write(stream, &dstate, "diplomacy_state"));
+        Sched_TryYield();
+    }}
+
+    struct attr cam_speed = (struct attr){
+        .type = TYPE_FLOAT,
+        .val.as_float = Camera_GetSpeed(s_gs.active_cam)
+    };
+    CHK_TRUE_RET(Attr_Write(stream, &cam_speed, "cam_speed"));
+
+    struct attr cam_sens = (struct attr){
+        .type = TYPE_FLOAT,
+        .val.as_float = Camera_GetSens(s_gs.active_cam)
+    };
+    CHK_TRUE_RET(Attr_Write(stream, &cam_sens, "cam_sensitivity"));
+
+    struct attr cam_pitch = (struct attr){
+        .type = TYPE_FLOAT,
+        .val.as_float = Camera_GetPitch(s_gs.active_cam)
+    };
+    CHK_TRUE_RET(Attr_Write(stream, &cam_pitch, "cam_pitch"));
+
+    Sched_TryYield();
+
+    struct attr cam_yaw = (struct attr){
+        .type = TYPE_FLOAT,
+        .val.as_float = Camera_GetYaw(s_gs.active_cam)
+    };
+    CHK_TRUE_RET(Attr_Write(stream, &cam_yaw, "cam_yaw"));
+
+    struct attr cam_pos = (struct attr){
+        .type = TYPE_VEC3,
+        .val.as_vec3 = Camera_GetPos(s_gs.active_cam)
+    };
+    CHK_TRUE_RET(Attr_Write(stream, &cam_pos, "cam_position"));
+
+    struct attr active_cam_mode = (struct attr){
+        .type = TYPE_INT, 
+        .val.as_int = s_gs.active_cam_mode
+    };
+    CHK_TRUE_RET(Attr_Write(stream, &active_cam_mode, "active_cam_mode"));
+
+    Sched_TryYield();
+
+    struct attr active_font = (struct attr){
+        .type = TYPE_STRING, 
+    };
+    pf_strlcpy(active_font.val.as_string, UI_GetActiveFont(), sizeof(active_font.val.as_string));
+    CHK_TRUE_RET(Attr_Write(stream, &active_font, "active_font"));
+
+    struct attr hide_healthbars = (struct attr){
+        .type = TYPE_BOOL, 
+        .val.as_bool = s_gs.hide_healthbars
+    };
+    CHK_TRUE_RET(Attr_Write(stream, &hide_healthbars, "hide_healthbars"));
+
+    struct attr show_unit_icons = (struct attr){
+        .type = TYPE_BOOL, 
+        .val.as_bool = s_gs.show_unit_icons
+    };
+    CHK_TRUE_RET(Attr_Write(stream, &show_unit_icons, "show_unit_icons"));
+
+    struct attr minimap_render_all = (struct attr){
+        .type = TYPE_BOOL, 
+        .val.as_bool = s_gs.minimap_render_all
+    };
+    CHK_TRUE_RET(Attr_Write(stream, &minimap_render_all, "minimap_render_all"));
+
+    struct attr attack_on_rclick = (struct attr){
+        .type = TYPE_BOOL, 
+        .val.as_bool = s_gs.attack_on_rclick
+    };
+    CHK_TRUE_RET(Attr_Write(stream, &attack_on_rclick, "attack_on_rclick"));
+
+    Sched_TryYield();
+
+    if(!G_Region_SaveState(stream))
+        return false;
+
+    return true;
+}
+
+bool G_LoadGlobalState(SDL_RWops *stream)
+{
+    ASSERT_IN_MAIN_THREAD();
+    struct attr attr;
+
+    CHK_TRUE_RET(Attr_Parse(stream, &attr, true));
+    CHK_TRUE_RET(attr.type == TYPE_BOOL);
+    Sched_TryYield();
+
+    if(attr.val.as_bool) {
+        CHK_TRUE_RET(G_LoadMap(stream, true));
+        Sched_TryYield();
+
+        CHK_TRUE_RET(Attr_Parse(stream, &attr, true));
+        CHK_TRUE_RET(attr.type == TYPE_VEC2);
+        G_SetMinimapPos(attr.val.as_vec2.x, attr.val.as_vec2.y);
+
+        CHK_TRUE_RET(Attr_Parse(stream, &attr, true));
+        CHK_TRUE_RET(attr.type == TYPE_QUAT);
+        M_MinimapSetBorderClr(attr.val.as_quat);
+
+        CHK_TRUE_RET(Attr_Parse(stream, &attr, true));
+        CHK_TRUE_RET(attr.type == TYPE_INT);
+        G_SetMinimapSize(attr.val.as_int);
+
+        CHK_TRUE_RET(Attr_Parse(stream, &attr, true));
+        CHK_TRUE_RET(attr.type == TYPE_INT);
+        M_Raycast_SetHighlightSize(attr.val.as_int);
+
+        CHK_TRUE_RET(G_Fog_LoadState(stream));
+        Sched_TryYield();
+    }else{
+        G_ClearState();
+        E_Global_Notify(EVENT_NEW_GAME, NULL, ES_ENGINE);
+    }
+
+    CHK_TRUE_RET(Attr_Parse(stream, &attr, true));
+    CHK_TRUE_RET(attr.type == TYPE_INT);
+    G_SetSimState(attr.val.as_int);
+
+    CHK_TRUE_RET(Attr_Parse(stream, &attr, true));
+    CHK_TRUE_RET(attr.type == TYPE_VEC3);
+    G_SetLightPos(attr.val.as_vec3);
+
+    CHK_TRUE_RET(Attr_Parse(stream, &attr, true));
+    CHK_TRUE_RET(attr.type == TYPE_VEC3);
+    G_SetAmbientLightColor(attr.val.as_vec3);
+
+    CHK_TRUE_RET(Attr_Parse(stream, &attr, true));
+    CHK_TRUE_RET(attr.type == TYPE_VEC3);
+    G_SetEmitLightColor(attr.val.as_vec3);
+
+    struct attr dir, ext;
+    CHK_TRUE_RET(Attr_Parse(stream, &dir, true));
+    CHK_TRUE_RET(dir.type == TYPE_STRING);
+    CHK_TRUE_RET(Attr_Parse(stream, &ext, true));
+    CHK_TRUE_RET(ext.type == TYPE_STRING);
+    G_SetSkybox(dir.val.as_string, ext.val.as_string);
+
+    CHK_TRUE_RET(Attr_Parse(stream, &attr, true));
+    CHK_TRUE_RET(attr.type == TYPE_INT);
+    int num_factions = attr.val.as_int;
+    Sched_TryYield();
+
+    for(int i = 0; i < num_factions; i++) {
+
+        struct faction fac;
+        uint16_t fac_id;
+
+        CHK_TRUE_RET(Attr_Parse(stream, &attr, true));
+        CHK_TRUE_RET(attr.type == TYPE_INT);
+        fac_id = attr.val.as_int; 
+
+        CHK_TRUE_RET(Attr_Parse(stream, &attr, true));
+        CHK_TRUE_RET(attr.type == TYPE_VEC3);
+        fac.color = attr.val.as_vec3;
+
+        CHK_TRUE_RET(Attr_Parse(stream, &attr, true));
+        CHK_TRUE_RET(attr.type == TYPE_STRING);
+        pf_snprintf(fac.name, sizeof(fac.name), "%s", attr.val.as_string);
+
+        CHK_TRUE_RET(Attr_Parse(stream, &attr, true));
+        CHK_TRUE_RET(attr.type == TYPE_BOOL);
+        fac.controllable = attr.val.as_bool;
+
+        s_gs.factions_allocd |= (0x1 << fac_id);
+        s_gs.factions[fac_id] = fac;
+        Sched_TryYield();
+    }
+
+    for(int i = 0; i < MAX_FACTIONS; i++) {
+    for(int j = 0; j < MAX_FACTIONS; j++) {
+
+        CHK_TRUE_RET(Attr_Parse(stream, &attr, true));
+        CHK_TRUE_RET(attr.type == TYPE_INT);
+        s_gs.diplomacy_table[i][j] = attr.val.as_int;
+        Sched_TryYield();
+    }}
+
+    CHK_TRUE_RET(Attr_Parse(stream, &attr, true));
+    CHK_TRUE_RET(attr.type == TYPE_FLOAT);
+    Camera_SetSpeed(s_gs.active_cam, attr.val.as_float);
+
+    CHK_TRUE_RET(Attr_Parse(stream, &attr, true));
+    CHK_TRUE_RET(attr.type == TYPE_FLOAT);
+    Camera_SetSens(s_gs.active_cam, attr.val.as_float);
+
+    CHK_TRUE_RET(Attr_Parse(stream, &attr, true));
+    CHK_TRUE_RET(attr.type == TYPE_FLOAT);
+    float pitch = attr.val.as_float; 
+
+    CHK_TRUE_RET(Attr_Parse(stream, &attr, true));
+    CHK_TRUE_RET(attr.type == TYPE_FLOAT);
+    float yaw = attr.val.as_float; 
+    Camera_SetPitchAndYaw(s_gs.active_cam, pitch, yaw);
+
+    CHK_TRUE_RET(Attr_Parse(stream, &attr, true));
+    CHK_TRUE_RET(attr.type == TYPE_VEC3);
+    Camera_SetPos(s_gs.active_cam, attr.val.as_vec3);
+
+    CHK_TRUE_RET(Attr_Parse(stream, &attr, true));
+    CHK_TRUE_RET(attr.type == TYPE_INT);
+    int active_cam_mode = attr.val.as_int;
+
+    G_SetActiveCamera(s_gs.active_cam, active_cam_mode);
+    Sched_TryYield();
+
+    CHK_TRUE_RET(Attr_Parse(stream, &attr, true));
+    CHK_TRUE_RET(attr.type == TYPE_STRING);
+    UI_SetActiveFont(attr.val.as_string);
+
+    CHK_TRUE_RET(Attr_Parse(stream, &attr, true));
+    CHK_TRUE_RET(attr.type == TYPE_BOOL);
+    s_gs.hide_healthbars = attr.val.as_bool;
+
+    CHK_TRUE_RET(Attr_Parse(stream, &attr, true));
+    CHK_TRUE_RET(attr.type == TYPE_BOOL);
+    s_gs.show_unit_icons= attr.val.as_bool;
+
+    CHK_TRUE_RET(Attr_Parse(stream, &attr, true));
+    CHK_TRUE_RET(attr.type == TYPE_BOOL);
+    s_gs.minimap_render_all = attr.val.as_bool;
+
+    CHK_TRUE_RET(Attr_Parse(stream, &attr, true));
+    CHK_TRUE_RET(attr.type == TYPE_BOOL);
+    s_gs.attack_on_rclick = attr.val.as_bool;
+    Sched_TryYield();
+
+    if(!G_Region_LoadState(stream))
+        return false;
+
+    return true;
+}
+
+bool G_SaveEntityState(SDL_RWops *stream)
+{
+    ASSERT_IN_MAIN_THREAD();
+    g_remove_queued();
+
+    if(!g_save_anim_state(stream))
+        return false;
+
+    if(!G_Sel_SaveState(stream))
+        return false;
+
+    /* Movement, combat, etc. state is only saved for sessions with a loaded map */
+    if(!s_gs.map)
+        return true;
+    
+    if(!G_Move_SaveState(stream))
+        return false;
+
+    if(!G_Formation_SaveState(stream))
+        return false;
+
+    if(!G_Combat_SaveState(stream))
+        return false;
+
+    if(!G_Building_SaveState(stream))
+        return false;
+
+    if(!G_Builder_SaveState(stream))
+        return false;
+
+    if(!G_StorageSite_SaveState(stream))
+        return false;
+
+    if(!G_Resource_SaveState(stream))
+        return false;
+
+    if(!G_Harvester_SaveState(stream))
+        return false;
+
+    if(!G_Garrison_SaveState(stream))
+        return false;
+
+    if(!G_Automation_SaveState(stream))
+        return false;
+
+    if(!G_Group_SaveState(stream))
+        return false;
+
+    return true;
+}
+
+bool G_LoadEntityState(SDL_RWops *stream)
+{
+    ASSERT_IN_MAIN_THREAD();
+
+    if(s_gs.map) {
+        G_BakeNavDataForScene();
+    }
+
+    if(!g_load_anim_state(stream)) {
+        fprintf(stderr, "Could not load animation state.\n");
+        return false;
+    }
+
+    if(!G_Sel_LoadState(stream)) {
+        fprintf(stderr, "Could not load selection state.\n");
+        return false;
+    }
+
+    if(!s_gs.map)
+        return true;
+
+    if(!G_Move_LoadState(stream)) {
+        fprintf(stderr, "Could not load movement state.\n");
+        return false;
+    }
+
+    if(!G_Formation_LoadState(stream)) {
+        fprintf(stderr, "Could not load formation state.\n");
+        return false;
+    }
+
+    if(!G_Combat_LoadState(stream)) {
+        fprintf(stderr, "Could not load combat state.\n");
+        return false;
+    }
+
+    if(!G_Building_LoadState(stream)) {
+        fprintf(stderr, "Could not load building state.\n");
+        return false;
+    }
+
+    if(!G_Builder_LoadState(stream)) {
+        fprintf(stderr, "could not load builder state.\n");
+        return false;
+    }
+
+    if(!G_StorageSite_LoadState(stream)) {
+        fprintf(stderr, "Could not load storage site state.\n");
+        return false;
+    }
+
+    if(!G_Resource_LoadState(stream)) {
+        fprintf(stderr, "Could not load resource state.\n");
+        return false;
+    }
+
+    if(!G_Harvester_LoadState(stream)) {
+        fprintf(stderr, "Could not load harvester state.\n");
+        return false;
+    }
+
+    if(!G_Garrison_LoadState(stream)) {
+        fprintf(stderr, "Could not load garrison state.\n");
+        return false;
+    }
+
+    if(!G_Automation_LoadState(stream)) {
+        fprintf(stderr, "Could not load automation state.\n");
+        return false;
+    }
+
+    if(!G_Group_LoadState(stream)) {
+        fprintf(stderr, "Could not load group state.\n");
+        return false;
+    }
+
+    return true;
+}
+

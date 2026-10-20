@@ -1,0 +1,509 @@
+********************************************************************************
+* CHANGELOG                                                                    *
+********************************************************************************
+
+================================================================================
+[Version 1.18.0] - 07.10.2026
+================================================================================
+    * Implement billboarding for efficient rendering of high entity counts
+    * Improve terrain rendering performance
+    * Turning and optimization of the movement pipeline
+
+================================================================================
+[Version 1.17.0] - 28.08.2026
+================================================================================
+    * Tune and extend combat mechanics
+    * Tune, extend, and optimize formation mechanics
+    * Movement-related turning and optimizations
+
+================================================================================
+[Version 1.16.0] - 21.06.2026
+================================================================================
+    * Re-work movement arrival behaviour
+    * Tuning to the movement and combat systems
+    * Extend tile rendering options; improvements to image quilting
+    * Performance improvements
+    * Support mousewheel zoom
+    * Miscellaneous fixes
+
+================================================================================
+[Version 1.15.0] - 02.06.2026
+================================================================================
+    * Implement static grass rendering over the map's surface
+    * Expand the engine's profiling and instrumentation capabilities
+    * Significant performance improvements accross multiple engine systems
+
+================================================================================
+[Version 1.14.0] - 19.05.2026
+================================================================================
+    * Implement animated sprite rendering
+    * Various fixes and improvements
+
+================================================================================
+[Version 1.13.0] - 16.07.2025
+================================================================================
+    * Implement GPU crowd simulation in a compute shader
+    * Implement toggle between CPU and GPU crowd simulation
+
+================================================================================
+[Version 1.12.0] - 30.06.2025
+================================================================================
+    * Batch together all animation poses into a single texture to speed up 
+      rendering of large numbers of animated entities
+
+================================================================================
+[Version 1.11.0] - 22.06.2025
+================================================================================
+    * Allow movement and simulation to run at various frequencies, changeable
+      by a dynamic setting
+    * Allow interpolating between entity states when the movement simulation
+      is run at a lower frequency
+    * Add a greater degree of parallelism to the movement/field computations
+    * Significant performance improvements to large unit count scenarios
+
+================================================================================
+[Version 1.10.0] - 24.04.2025
+================================================================================
+    * Integrate with mi-malloc (process-wide allocator)
+
+================================================================================
+[Version 1.9.0] - 31.03.2025
+================================================================================
+    * Improve responsiveness (OS event handling latency) during loading
+    * Show different images and progress text during loading
+
+================================================================================
+[Version 1.8.0] - 24.03.2025
+================================================================================
+    * Extend PFMAP and PFSCENE format
+    * Add texture splatting to the map surface
+    * Support 9-patch UI
+    * Miscellaneous bug fixes and improvements
+
+================================================================================
+[Version 1.7.0] - 02.09.2024
+================================================================================
+    * Add embedded interactive Python console
+
+================================================================================
+[Version 1.6.0] - 31.08.2024
+================================================================================
+    * Implement Perlin noise generation
+    * Implement bump mapping for the map surface
+
+================================================================================
+[Version 1.5.0] - 20.08.2024
+================================================================================
+    * Implement programmatic synthesis of textures using the Image Quilting i
+      algorithm
+    * Implement aperiodic tiling of the map plane using the Wang Tiling 
+      algorithm
+
+================================================================================
+[Version 1.4.0] - 06.03.2024
+================================================================================
+    * Implement basic system for automation of transporters
+    * Improve and fix various harvester and transporter behaviours
+    * Implement mechanism for rendering a dynamic set of 2D icons over/near 
+      entities.
+    * Fix and expand on a number of resource behaviours
+    * Miscellaneous fixes and performance improvements
+
+===============================================================================
+[Version 1.3.0] - 09.02.2024
+================================================================================
+    * Support navigation of land, water, and air units
+    * Implement unit garrison and transportation mechanics
+
+================================================================================
+[Version 1.2.0] - 07.12.2023
+================================================================================
+    * Add support for formation-based unit movement and placement
+    * Miscellaneous enhancements and bug fixes
+
+================================================================================
+[Version 1.1.0] - 02.11.2023
+================================================================================
+    * Make session saving/loading asynchronous
+    * Make movement and combat simulation asynchronous
+        --> significant performance improvements to battles with large unit 
+            counts
+    * Numerous bug fixes and stability improvements
+    * Support Visual Studio build
+
+================================================================================
+[Version 1.00.0] - 08.05.2021
+================================================================================
+    * Numerous bug fixes and stability improvements
+    * Improving robustness of pathfinding/navigation
+    * Lots and lots of polish
+
+================================================================================
+[Version 0.56.0] - 19.03.2021
+================================================================================
+    * Implement ranged combat using an accurate projectile physics simulation
+    * Improve behaviour of group movement and combat target finding
+    * Miscellaneous enhancements and bug fixes
+
+================================================================================
+[Version 0.55.0] - 27.02.2021
+================================================================================
+    * Add audio system capable of playing effects at locations ("positional 
+      effects") and global effects/music
+    * Support pathfinding of "large" units (by adding multiple "navigation 
+      layers" and finding paths on a per-layer basis)
+    * Miscellaneous enhancements/polishing and bug fixes
+
+================================================================================
+[Version 0.54.0] - 10.02.2021
+================================================================================
+    * Implement system for keeping track of entity membership to spatial regions  
+    * Add 'tags' to entities - to associate strings with entities and make
+      allow making efficient queries for entities with a particular 'tag'
+    * Update PFSCENE format to have sections; add 'regions' section
+        --> makes it easier to extend the format going forward
+    * Numerous bug fixes - improvements to stability, robustness
+
+================================================================================
+[Version 0.53.0] - 20.11.2020
+================================================================================
+    * Implement resource gathering and transporting mechanics
+    * Add (optional) resource requirements for buildings
+    * Add contextual right-click actions with custom cursors
+    * Miscellaneous enhancements/polishing and bug fixes
+
+================================================================================
+[Version 0.52.0] - 08.10.2020
+================================================================================
+    * Numerous bug fixes and general enhancements
+
+================================================================================
+[Version 0.51.0] - 23.09.2020
+================================================================================
+    * Implement base-building mechanics
+
+================================================================================
+[Version 0.50.0] - 24.08.2020
+================================================================================
+    * Introduce fiber-backed Python task objects, allowing writing of 
+      cooperative multitasking code in Python
+
+================================================================================
+[Version 0.49.0] - 10.08.2020
+================================================================================
+    * Expose camera to Python scripting
+    * Expose many more UI style attributes to Python scripting
+    * Introduce file browser UI widget
+    * Introduce "subsession stack" to allow switching between multiple different
+      engine contexts that are serialized to memory buffers
+
+================================================================================
+[Version 0.48.0] - 16.07.2020
+================================================================================
+    * Implement fiber/task system
+        --> Allows putting work in tasks that are scheduled in userspace
+        --> The tasks can pass messages to each other, wait on events, and more
+
+================================================================================
+[Version 0.47.0] - 03.06.2020
+================================================================================
+    * Implement batch rendering system
+    * Add caching of OpenGL uniform state
+    * Add profiling of GPU time
+
+================================================================================
+[Version 0.46.0] - 16.05.2020
+================================================================================
+    * Implement fog-of-war mechanics
+    * Introduce OpenGL ringbuffer data structure for streaming data to GPU
+
+================================================================================
+[Version 0.45.0] - 25.04.2020
+================================================================================
+    * Miscellaneous bug fixes
+    * Introduce intrusive profiling framework
+
+================================================================================
+[Version 0.44.0] - 14.04.2020
+================================================================================
+    * Various pickling fixes
+    * Trim down Python's stdlib to a minimal subset
+    * Implement logic to serialize and deserialize any engine session
+
+================================================================================
+[Version 0.43.0] - 20.02.2020
+================================================================================
+    * Introduce Windows cross-compilation build target
+    * Windows compatibility fixes
+    * Add launcher that doesn't require command-line arguments
+
+================================================================================
+[Version 0.42.0] - 02.02.2020
+================================================================================
+    * Pipeline simulation and rendering to run on different threads 
+        --> Performance improvement of high unit count scenarios
+
+================================================================================
+[Version 0.41.0] - 31.12.2019
+================================================================================
+    * Navigation/movement pipeline improvements:
+        --> Introduce 'enemy seek fields' to guide entities towards nearby 
+            enemy entities
+        --> Introduce 'blockers' field which keeps track of dynamic pathing 
+            blockers. Stationary entities will now 'block' tiles underneath them
+        --> Keep track of which portals are currently 'blocked' (unreachable)
+            from neighbour portals and use this information in pathfinding
+        --> Miscellaneous optimizations to enable better scaling of pathfinding
+            for large groups
+
+================================================================================
+[Version 0.40.0] - 25.11.2019
+================================================================================
+    * Implement quadtree data structure
+    * Add efficient spatial indexing of entities; implement fast range queries
+
+================================================================================
+[Version 0.39.0] - 03.11.2019
+================================================================================
+    * Implement serialization and deserialization of the entire Python 
+      interpreter state
+        --> Includes support for all built-in types, including exotic ones
+            like 'generator' or 'getset_descriptor'
+
+================================================================================
+[Version 0.38.0] - 18.08.2019
+================================================================================
+    * Movement/pathing improvements
+
+================================================================================
+[Version 0.37.0] - 08.08.2019
+================================================================================
+    * Implement water rendering (including reflection, refraction and soft edge
+      effects)
+
+================================================================================
+[Version 0.36.0] - 20.07.2019
+================================================================================
+    * Implement logic for 'anchoring' UI elements
+        --> UI element bounds will be computed for different aspect ratios
+            based on their 'resize options'
+
+================================================================================
+[Version 0.35.0] - 07.06.2019
+================================================================================
+    * Implement pause/resume system
+    * Implement dynamic collision avoidance of multiple entites using Hybrid
+      Reciprocal Velocity Obstacles and the ClearPath algorithm
+    * Various tweaks to movement/flocking behaviours
+
+================================================================================
+[Version 0.34.0] - 15.05.2019
+================================================================================
+    * Implement LRU cache and memory pool generic data structures
+    * Some improvements to entity movement behaviours and performance
+
+================================================================================
+[Version 0.33.0] - 29.04.2019
+================================================================================
+    * Implement a 'smooth' terrain look by blending top face normals
+    * Implement some additional terrain options in the editor
+    * Update pfmap format
+
+================================================================================
+[Version 0.32.0] - 15.04.2019
+================================================================================
+    * Implement some additional video settings
+    * Scale the UI for different resolutions
+
+================================================================================
+[Version 0.31.0] - 24.03.2019
+================================================================================
+    * Implement settings system
+    * implement some dynamic user video settings
+
+================================================================================
+[Version 0.30.0] - 28.02.2019
+================================================================================
+    * Implement health bars
+
+================================================================================
+[Version 0.29.0] - 24.01.2019
+================================================================================
+    * Improve performance of terrain rendering and remove prior limitations of
+      map rendering
+
+================================================================================
+[Version 0.28.0] - 27.12.2018
+================================================================================
+    * Add loading screen on engine startup
+    * Implement 'action pad' UI for issuing commands to units
+
+================================================================================
+[Version 0.27.0] - 08.12.2018
+================================================================================
+    * Implementation of directional light shadow mapping
+
+================================================================================
+[Version 0.26.0] - 22.11.2018
+================================================================================
+    * Implementation of combat system
+
+================================================================================
+[Version 0.25.0] - 09.11.2018
+================================================================================
+    * Add support for creating different factions in editor, associate every
+      entity with a faction
+
+================================================================================
+[Version 0.24.0] - 30.08.2018
+================================================================================
+    * Generation of LOS fields
+    * Flow-field pathfinding
+
+================================================================================
+[Version 0.23.0] - 24.08.2018
+================================================================================
+    * Implement generation and caching of required flow field chunks for 
+      point-to-point paths
+
+================================================================================
+[Version 0.22.0] - 14.08.2018
+================================================================================
+    * Implement collision avoidance behaviour
+
+================================================================================
+[Version 0.21.0] - 21.07.2018
+================================================================================
+    * Point-to-point animated movement of entities, directed by mouse clicks
+    * Implementation of various steering/flocking behaviours for coordinated 
+      movement
+    * Constants exposed from engine to Python instead of being hard-coded in 
+      different places
+
+================================================================================
+[Version 0.20.0] - 09.07.2018
+================================================================================
+    * Update cost field for arbitrary impassable objects based on objects' OBBs
+    * Miscellaneous fixes to editor
+
+================================================================================
+[Version 0.19.0] - 30.06.2018
+================================================================================
+    * Create a navigation grid for each map chunk, with per-tile costs
+    * Link different navigation chunks with portals in an N-way graph
+
+================================================================================
+[Version 0.18.0] - 19.06.2018
+================================================================================
+    * Implement export of entities in editor (PFSCENE files)
+    * Implement de-serialization of game entities from PFSCENE files
+
+================================================================================
+[Version 0.17.0] - 13.06.2018
+================================================================================
+    * Allow placing/moving/deleting of objects in editor
+    * Allow sharing of rendering/animation data between different entities
+
+================================================================================
+[Version 0.16.0] - 28.05.2018
+================================================================================
+    * Implement RTS-style unit selection
+
+================================================================================
+[Version 0.15.0] - 16.05.2018
+================================================================================
+    * Add collision boxes to game entities
+    * Add rotation to game entities
+    * Fixes to skeletal animation
+
+================================================================================
+[Version 0.14.0] - 10.05.2018
+================================================================================
+    * Implement minimap
+
+================================================================================
+[Version 0.13.0] - 04.05.2018
+================================================================================
+    * Greatly improve performance of map rendering
+        --> Render chunk top surface to a texture to avoid repetitive blending
+        --> Frustum cull chunks that aren't visible, allowing huge maps
+
+================================================================================
+[Version 0.12.0] - 16.04.2018
+================================================================================
+    * Add smooth transition between adjacent tiles with different textures
+
+================================================================================
+[Version 0.11.0] - 05.04.2018
+================================================================================
+    * Add brush size option to editor
+    * Add elevation option to editor
+        --> Can place elevation with 'smooth' edges using marching squares
+            algorithm 
+
+================================================================================
+[Version 0.10.0] - 01.04.2018
+================================================================================
+    * Add initial implementation of the map editor
+        --> Able to save and load maps to and from PFMAP files
+        --> Able to edit the terrain texture per tile
+
+================================================================================
+[Version 0.9.0] - 02.03.2018
+================================================================================
+    * Add raycasting and collision logic
+    * Highlighting of tile under cursor
+
+================================================================================
+[Version 0.8.0] - 18.02.2018
+================================================================================
+    * Integrate with nuklear UI
+    * Add some performance metrics
+
+================================================================================
+[Version 0.7.0] - 14.02.2018
+================================================================================
+    * Add event system
+
+================================================================================
+[Version 0.6.0] - 05.02.2018
+================================================================================
+     * Fix terrain normals  
+     * Use correct shader for static meshes
+     * Implement all remaining corner tiles
+     * Update pfmap format
+
+================================================================================
+[Version 0.5.0] - 03.02.2018
+================================================================================
+    * Add dependencies to repository and add option to build them from source
+    * Port to Windows
+
+================================================================================
+[Version 0.4.0] - 20.01.2018
+================================================================================
+    * Integrate with Python 2.7 scripting
+
+================================================================================
+[Version 0.3.0] - 13.01.2018
+================================================================================
+    * Add RTS camera mode
+    * Add support for custom cursor images
+
+================================================================================
+[Version 0.2.0] - 07.01.2018
+================================================================================
+    * Add rendering of tile-based maps parsed from ASCII file
+        --> different-height flat tiles, ramps, and corner tiles available
+        --> custom textures specified per tile
+
+================================================================================
+[Version 0.1.0] - 30.12.2017
+================================================================================
+    * Initial release of engine source code
+    * OpenGL 3.3 programmable pipeline
+    * Custom ASCII model format with Blender export script
+    * Skeletal animation with GPU skinning
+    * Phong reflection model with materials
+    * FPS camera
+

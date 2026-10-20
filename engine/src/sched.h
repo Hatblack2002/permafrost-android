@@ -1,0 +1,161 @@
+/*
+ *  This file is part of Permafrost Engine. 
+ *  Copyright (C) 2020-2023 Eduard Permyakov 
+ *
+ *  Permafrost Engine is free software: you can redistribute it and/or modify
+ *  it under the terms of the GNU General Public License as published by
+ *  the Free Software Foundation, either version 3 of the License, or
+ *  (at your option) any later version.
+ *
+ *  Permafrost Engine is distributed in the hope that it will be useful,
+ *  but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *  GNU General Public License for more details.
+ *
+ *  You should have received a copy of the GNU General Public License
+ *  along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ * 
+ *  Linking this software statically or dynamically with other modules is making 
+ *  a combined work based on this software. Thus, the terms and conditions of 
+ *  the GNU General Public License cover the whole combination. 
+ *  
+ *  As a special exception, the copyright holders of Permafrost Engine give 
+ *  you permission to link Permafrost Engine with independent modules to produce 
+ *  an executable, regardless of the license terms of these independent 
+ *  modules, and to copy and distribute the resulting executable under 
+ *  terms of your choice, provided that you also meet, for each linked 
+ *  independent module, the terms and conditions of the license of that 
+ *  module. An independent module is a module which is not derived from 
+ *  or based on Permafrost Engine. If you modify Permafrost Engine, you may 
+ *  extend this exception to your version of Permafrost Engine, but you are not 
+ *  obliged to do so. If you do not wish to do so, delete this exception 
+ *  statement from your version.
+ *
+ */
+
+#ifndef SCHED_H
+#define SCHED_H
+
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+#include <assert.h>
+#include <SDL_atomic.h>
+
+
+#define NULL_TID (0)
+#define NULL_RESULT (struct result){0}
+
+#define ASSERT_IN_CTX(tid) \
+    assert(Sched_ActiveTID() == (tid))
+
+enum{
+    RESULT_FLOAT,
+    RESULT_INT,
+    RESULT_BOOL,
+    RESULT_PTR,
+};
+
+/* Careful changing the size of this. It is assumed to be (64-128] bits 
+ * s.t. it's returned via registers.
+ */
+struct result{
+    uint64_t type;
+    union{
+        float    as_float;
+        uint64_t as_int;
+        bool     as_bool;
+        void    *as_ptr;
+    }val;
+};
+
+enum comp_status{
+    FUTURE_INCOMPLETE = 0,
+    FUTURE_COMPLETE   = 1
+};
+
+struct future{
+    struct result res;
+    SDL_atomic_t  status;
+};
+
+enum{
+    TASK_MAIN_THREAD_PINNED = (1 << 0),
+    TASK_DETACHED           = (1 << 1),
+    TASK_BIG_STACK          = (1 << 2),
+    TASK_RUN_DURING_PAUSE   = (1 << 3),
+    TASK_SCRIPT             = (1 << 4)
+};
+
+typedef struct result (*task_func_t)(void *);
+
+/* The following may only be called from any context */
+
+bool     Sched_FutureIsReady(const struct future *future);
+void     Sched_TryYield(void);
+
+/* The following may only be called from main thread context */
+
+bool     Sched_Init(void);
+void     Sched_Shutdown(void);
+void     Sched_HandleEvent(int event, void *arg, int event_source, bool immediate);
+void     Sched_StartBackgroundTasks(void);
+void     Sched_Tick(void);
+/* Park the workers at their next yield point; the frame's buffers may be
+ * swapped once this returns. */
+void     Sched_QuiesceWorkers(void);
+/* Where the last Sched_Tick spent its time: running main-thread tasks, and
+ * waiting for the workers to finish their slices at the end of the frame.
+ */
+void     Sched_LastTickTimes(uint64_t *out_task_us, uint64_t *out_quiesce_us);
+uint32_t Sched_Create(int prio, task_func_t code, void *arg, const char *name,
+                     struct future *result, int flags);
+uint32_t Sched_CreateBlocking(int prio, task_func_t code, void *arg, const char *name,
+                              struct future *result, int flags);
+bool     Sched_RunSync(uint32_t tid);
+void     Sched_AwaitAll(const uint32_t *tids, const struct future *futures, size_t n);
+
+/* Run fn over every index in [0, nitems) on the worker pool, the calling
+ * thread claiming chunk-sized ranges alongside the workers. Returns once every
+ * range has completed. A single batch may be in flight engine-wide, and the
+ * range function must not call back into any Task_* or Sched_* API.
+ */
+void     Sched_ParallelFor(void (*fn)(int begin, int end, void *arg), void *arg,
+                           size_t nitems, size_t chunk);
+void     Sched_ClearState(void);
+void     Sched_Flush(void);
+bool     Sched_HasBlocked(void);
+bool     Sched_IsReady(uint32_t tid);
+bool     Sched_IsEventBlocked(uint32_t tid);
+bool     Sched_TryCancel(uint32_t tid);
+bool     Sched_AbortScriptBlocked(uint32_t tid);
+
+/* The following may only be called from task context 
+ * (i.e. from the body of a task function) */
+
+enum reqtype{
+    SCHED_REQ_CREATE,
+    SCHED_REQ_MY_TID,
+    SCHED_REQ_MY_PARENT_TID,
+    SCHED_REQ_YIELD,
+    SCHED_REQ_SEND,
+    SCHED_REQ_RECEIVE,
+    SCHED_REQ_REPLY,
+    SCHED_REQ_AWAIT_EVENT,
+    SCHED_REQ_SET_DESTRUCTOR,
+    SCHED_REQ_WAIT,
+    SCHED_REQ_RESCHED_ON_MAIN,
+    _SCHED_REQ_COUNT,
+};
+
+struct request{
+    enum reqtype type;
+    uint64_t     argv[6];
+};
+
+uint64_t Sched_Request(struct request req);
+uint32_t Sched_ActiveTID(void);
+bool     Sched_UsingBigStack(void);
+
+#endif
+

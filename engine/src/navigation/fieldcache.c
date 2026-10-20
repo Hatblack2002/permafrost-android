@@ -1,0 +1,894 @@
+/*
+ *  This file is part of Permafrost Engine. 
+ *  Copyright (C) 2018-2023 Eduard Permyakov 
+ *
+ *  Permafrost Engine is free software: you can redistribute it and/or modify
+ *  it under the terms of the GNU General Public License as published by
+ *  the Free Software Foundation, either version 3 of the License, or
+ *  (at your option) any later version.
+ *
+ *  Permafrost Engine is distributed in the hope that it will be useful,
+ *  but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *  GNU General Public License for more details.
+ *
+ *  You should have received a copy of the GNU General Public License
+ *  along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ * 
+ *  Linking this software statically or dynamically with other modules is making 
+ *  a combined work based on this software. Thus, the terms and conditions of 
+ *  the GNU General Public License cover the whole combination. 
+ *  
+ *  As a special exception, the copyright holders of Permafrost Engine give 
+ *  you permission to link Permafrost Engine with independent modules to produce 
+ *  an executable, regardless of the license terms of these independent 
+ *  modules, and to copy and distribute the resulting executable under 
+ *  terms of your choice, provided that you also meet, for each linked 
+ *  independent module, the terms and conditions of the license of that 
+ *  module. An independent module is a module which is not derived from 
+ *  or based on Permafrost Engine. If you modify Permafrost Engine, you may 
+ *  extend this exception to your version of Permafrost Engine, but you are not 
+ *  obliged to do so. If you do not wish to do so, delete this exception 
+ *  statement from your version.
+ *
+ */
+
+#define MEM_FILE_SYS MEM_SYS_NAV
+#define MEM_FILE_SUB MEM_SUB_NAV_FIELDCACHE
+
+#include "fieldcache.h"
+#include "nav_private.h"
+#include "../lib/public/lru_cache.h"
+#include "../lib/public/khash.h"
+#include "../lib/public/vec.h"
+#include "../mem.h"
+#include "../event.h"
+#include "../sched.h"
+#include "../config.h"
+#include "../map/public/tile.h"
+
+#include <assert.h>
+#include <math.h>
+
+#undef PF_MALLOC
+#undef PF_CALLOC
+#undef PF_REALLOC
+#define PF_MALLOC(_n)       PF_MALLOC_TAGGED((_n), MEM_SYS_NAV, MEM_SUB_NAV_FIELDCACHE)
+#define PF_CALLOC(_c, _n)   PF_CALLOC_TAGGED((_c), (_n), MEM_SYS_NAV, MEM_SUB_NAV_FIELDCACHE)
+#define PF_REALLOC(_p, _n)  PF_REALLOC_TAGGED((_p), (_n), MEM_SYS_NAV, MEM_SUB_NAV_FIELDCACHE)
+
+
+LRU_CACHE_TYPE(los, struct LOS_field)
+LRU_CACHE_PROTOTYPES(static, los, struct LOS_field)
+LRU_CACHE_IMPL(static, los, struct LOS_field)
+
+LRU_CACHE_TYPE(flow, struct flow_field)
+LRU_CACHE_PROTOTYPES(static, flow, struct flow_field)
+LRU_CACHE_IMPL(static, flow, struct flow_field)
+
+LRU_CACHE_TYPE(ffid, ff_id_t)
+LRU_CACHE_PROTOTYPES(static, ffid, ff_id_t)
+LRU_CACHE_IMPL(static, ffid, ff_id_t)
+
+LRU_CACHE_TYPE(grid_path, struct grid_path_desc)
+LRU_CACHE_PROTOTYPES(static, grid_path, struct grid_path_desc)
+LRU_CACHE_IMPL(static, grid_path, struct grid_path_desc)
+
+VEC_TYPE(id, uint64_t)
+VEC_PROTOTYPES(static, id, uint64_t)
+VEC_IMPL(static, id, uint64_t)
+
+KHASH_MAP_INIT_INT64(idvec, vec_id_t)
+KHASH_MAP_INIT_INT64(stale, uint32_t)
+
+struct priv_fc_stats{
+    unsigned los_query;
+    unsigned los_hit;
+    unsigned los_invalidated;
+    unsigned flow_query;
+    unsigned flow_hit;
+    unsigned flow_invalidated;
+    unsigned ffid_query;
+    unsigned ffid_hit;
+    unsigned grid_path_query;
+    unsigned grid_path_hit;
+};
+
+struct fieldcache_ctx{
+    lru(los)          los_cache;       /* key: (dest_id, chunk coord) */
+    lru(flow)         flow_cache;      /* key: (ffid) */
+    /* The ffid cache maps a (dest_id, chunk coordinate) tuple to a flow field ID,
+     * which could be used to retreive the relevant field from the flow cache. 
+     * The reason for this is that the same flow field chunk can be shared between
+     * many different paths. */
+    lru(ffid)         ffid_cache;      /* key: (dest_id, chunk_coord) */
+    lru(grid_path)    grid_path_cache; /* key: (chunk coord, tile start coord, tile dest coord) */
+    
+    /* The following structures are maintained for efficient invalidation of entries:*/
+    khash_t(idvec)   *chunk_ffield_map; /* key: (chunk coord) */
+    khash_t(idvec)   *chunk_lfield_map; /* key: (chunk coord) */
+    /* Destinations whose route skirted a blocked edge in the chunk. The entries
+     * outlive the routes: a destination nobody heads for has no fields to mark.
+     */
+    khash_t(idvec)   *chunk_detour_map; /* key: (chunk coord) */
+
+    /* Fields served stale until their rate-capped rebuild publishes; the
+     * value is the tick the rebuild becomes due. Keyed by ffid. */
+    khash_t(stale)   *flow_stale;
+    /* Same for LOS fields, keyed by (dest_id, chunk coord). */
+    khash_t(stale)   *los_stale;
+    uint32_t          tick;
+
+    /* Statistics */
+    struct priv_fc_stats perfstats;
+};
+
+/* The field cache is a process-wide singleton owned by the navigation tick
+ * task. The task registers a provider for its tid so that every cache access
+ * can be validated against the current task context.
+ */
+static struct fieldcache_ctx *s_singleton;
+static uint32_t             (*s_nav_task_tid_provider)(void);
+
+/* Ticks a surround field for an unmoved target may be kept before a forced
+ * rebuild picks up crowd-induced passability changes around it.
+ */
+#define SURROUND_FIELD_MAX_AGE (4)
+
+/* Ticks an invalidated field is served stale before its rebuild; caps the
+ * melee blocker-churn flood cost. Point-seek is longer: its rebuild re-runs
+ * the whole corridor, and it also damps route flapping through crowd gaps.
+ */
+#define ENEMY_SEEK_REBUILD_PERIOD_TICKS (5)
+#define POINT_SEEK_REBUILD_PERIOD_TICKS (10)
+#define SURROGATE_REBUILD_PERIOD_TICKS  (20)
+/* A melee's blocker churn mass-invalidates the (dest, chunk) LOS fields every
+ * tick; a straight-line visibility answer a few ticks stale is indistinguishable
+ * in play, and the budgeted rebuild keeps it bounded. */
+#define LOS_REBUILD_PERIOD_TICKS        (5)
+
+/* A fieldcache mutation is safe either when no navigation task is in flight (e.g. the
+ * synchronous save-time flush, which runs in a session-task fiber) or when it happens
+ * on the in-flight nav task itself. The provider reads NULL_TID when no task is active. */
+#define FC_ASSERT_NAV_TASK()                                            \
+    do {                                                                \
+        uint32_t _navtid = s_nav_task_tid_provider                      \
+                         ? s_nav_task_tid_provider() : NULL_TID;        \
+        assert(_navtid == NULL_TID || Sched_ActiveTID() == _navtid);    \
+    }while(0)
+
+/*****************************************************************************/
+/* STATIC FUNCTIONS                                                          */
+/*****************************************************************************/
+
+uint32_t key_for_chunk(struct coord chunk)
+{
+    return (((uint64_t)chunk.r & 0xffff) << 16) | ((uint64_t)chunk.c & 0xffff);
+}
+
+uint64_t key_for_dest_and_chunk(dest_id_t id, struct coord chunk)
+{
+    return ((((uint64_t)id) << 32) | key_for_chunk(chunk));
+}
+
+dest_id_t key_dest(uint64_t key)
+{
+    return (key >> 32);
+}
+
+struct coord key_chunk(uint64_t key)
+{
+    return (struct coord){
+        (key >> 16) & 0xffff,
+        (key >>  0) & 0xffff,
+    };
+}
+
+uint64_t grid_path_key(struct coord local_start, struct coord local_dest,
+                       struct coord chunk, enum nav_layer layer)
+{
+    return ((( ((uint64_t)local_start.r) & 0xff  ) <<  0)
+         |  (( ((uint64_t)local_start.c) & 0xff  ) <<  8)
+         |  (( ((uint64_t)local_dest.r)  & 0xff  ) << 16)
+         |  (( ((uint64_t)local_dest.c)  & 0xff  ) << 24)
+         |  (( ((uint64_t)chunk.r)       & 0x3fff) << 32)
+         |  (( ((uint64_t)chunk.c)       & 0x3fff) << 46)
+         |  (( ((uint64_t)layer)         & 0xf   ) << 60));
+}
+
+static void on_grid_path_evict(struct grid_path_desc *victim)
+{
+    vec_coord_destroy(&victim->path);
+}
+
+static void destroy_all_entries(khash_t(idvec) *hash)
+{
+    uint32_t key;
+    vec_id_t curr;
+    (void)key;
+
+    kh_foreach(hash, key, curr, {
+        vec_id_destroy(&curr); 
+    });
+}
+
+static void field_map_add(khash_t(idvec) *hash, uint64_t key, uint64_t id)
+{
+    khiter_t k = kh_get(idvec, hash, key);
+    if(k != kh_end(hash)) {
+
+        vec_id_t *curr = &kh_val(hash, k);
+        /* Stale-served fields republish; don't grow the list with dups. */
+        for(int i = 0; i < vec_size(curr); i++) {
+            if(vec_AT(curr, i) == id)
+                return;
+        }
+        vec_id_push(curr, id);
+    }else{
+        vec_id_t newvec;
+        vec_id_init(&newvec);
+        vec_id_push(&newvec, id);
+
+        int ret;
+        kh_put(idvec, hash, key, &ret);
+        assert(ret != -1 && ret != 0);
+        k = kh_get(idvec, hash, key);
+        kh_val(hash, k) = newvec;
+    }
+}
+
+/* Marks a cached field stale-served until its rate-capped rebuild; a fresh
+ * mark counts as one invalidation.
+ */
+static bool flow_mark_stale(struct fieldcache_ctx *ctx, ff_id_t ffid, uint32_t period)
+{
+    if(lru_flow_peek(&ctx->flow_cache, ffid) == NULL)
+        return false;
+    int put_ret;
+    khiter_t s = kh_put(stale, ctx->flow_stale, ffid, &put_ret);
+    if(put_ret == 0)
+        return false;
+    kh_val(ctx->flow_stale, s) = ctx->tick + period;
+    ctx->perfstats.flow_invalidated++;
+    return true;
+}
+
+static bool id_vec_contains(const vec_id_t *vec, uint64_t id)
+{
+    for(int i = 0; i < vec_size(vec); i++) {
+        if(vec_AT(vec, i) == id)
+            return true;
+    }
+    return false;
+}
+
+static bool dest_array_contains(dest_id_t *array, size_t size, dest_id_t item)
+{
+    for(int i = 0; i < size; i++) {
+        if(array[i] == item)
+            return true;
+    }
+    return false;
+}
+
+static void clear_chunk_los_map(struct fieldcache_ctx *ctx, uint64_t key, enum nav_layer layer)
+{
+    khiter_t k = kh_get(idvec, ctx->chunk_lfield_map, key);
+    if(k == kh_end(ctx->chunk_lfield_map))
+        return;
+
+    vec_id_t *keys = &kh_val(ctx->chunk_lfield_map, k);
+    for(int i = vec_size(keys)-1; i >= 0; i--) {
+
+        uint64_t key = vec_AT(keys, i);
+        if(N_DestLayer(key_dest(key)) != layer)
+            continue;
+
+        /* Blocker churn: serve the LOS field stale while its rate-capped
+         * rebuild is pending; a fresh mark counts as one invalidation. */
+        if(lru_los_peek(&ctx->los_cache, key) != NULL) {
+            int put_ret;
+            khiter_t s = kh_put(stale, ctx->los_stale, key, &put_ret);
+            if(put_ret != 0) {
+                kh_val(ctx->los_stale, s) = ctx->tick + LOS_REBUILD_PERIOD_TICKS;
+                ctx->perfstats.los_invalidated++;
+            }
+            continue;
+        }
+
+        khiter_t s = kh_get(stale, ctx->los_stale, key);
+        if(s != kh_end(ctx->los_stale)) {
+            kh_del(stale, ctx->los_stale, s);
+        }
+
+        bool found = lru_los_remove(&ctx->los_cache, key);
+        ctx->perfstats.los_invalidated += !!found;
+        vec_id_del(keys, i);
+    }
+    if(vec_size(keys) == 0) {
+        vec_id_destroy(keys);
+        kh_del(idvec, ctx->chunk_lfield_map, k);
+    }
+}
+
+static size_t clear_chunk_flow_map(struct fieldcache_ctx *ctx, uint64_t key,
+                                   enum nav_layer layer, int only_target_type)
+{
+    khiter_t k = kh_get(idvec, ctx->chunk_ffield_map, key);
+    if(k == kh_end(ctx->chunk_ffield_map))
+        return 0;
+
+    size_t ret = 0;
+    vec_id_t *keys = &kh_val(ctx->chunk_ffield_map, k);
+    for(int i = vec_size(keys)-1; i >= 0; i--) {
+
+        ff_id_t key = vec_AT(keys, i);
+        if(N_FlowFieldLayer(key) != layer)
+            continue;
+
+        if(only_target_type >= 0 && (N_FlowFieldTargetType(key) != only_target_type))
+            continue;
+
+        /* Enemy/point-seek fields are served stale while their rate-capped
+         * rebuild is pending. Zone fields must rebuild eagerly; surround
+         * fields have their own cap. */
+        int ttype = N_FlowFieldTargetType(key);
+        if((ttype == TARGET_ENEMIES || ttype == TARGET_TILE || ttype == TARGET_PORTAL)
+        && lru_flow_peek(&ctx->flow_cache, key) != NULL) {
+            ret += flow_mark_stale(ctx, key, (ttype == TARGET_ENEMIES)
+                ? ENEMY_SEEK_REBUILD_PERIOD_TICKS
+                : POINT_SEEK_REBUILD_PERIOD_TICKS);
+            continue;
+        }
+
+        khiter_t s = kh_get(stale, ctx->flow_stale, key);
+        if(s != kh_end(ctx->flow_stale)) {
+            kh_del(stale, ctx->flow_stale, s);
+        }
+
+        bool found = lru_flow_remove(&ctx->flow_cache, key);
+        ctx->perfstats.flow_invalidated += !!found;
+        ret += !!found;
+        vec_id_del(keys, i);
+    }
+    if(vec_size(keys) == 0) {
+        vec_id_destroy(keys);
+        kh_del(idvec, ctx->chunk_ffield_map, k);
+    }
+    return ret;
+}
+
+/*****************************************************************************/
+/* EXTERN FUNCTIONS                                                          */
+/*****************************************************************************/
+
+bool N_FC_Init(struct fieldcache_ctx *ctx)
+{
+    if(!lru_los_init(&ctx->los_cache, CONFIG_LOS_CACHE_SZ, NULL))
+        goto fail_los;
+
+    if(!lru_flow_init(&ctx->flow_cache, CONFIG_FLOW_CACHE_SZ, NULL))
+        goto fail_flow;
+
+    if(!lru_ffid_init(&ctx->ffid_cache, CONFIG_MAPPING_CACHE_SZ, NULL))
+        goto fail_ffid;
+
+    if(!lru_grid_path_init(&ctx->grid_path_cache, CONFIG_GRID_PATH_CACHE_SZ, on_grid_path_evict))
+        goto fail_grid_path;
+
+    if(NULL == (ctx->chunk_ffield_map = kh_init(idvec)))
+        goto fail_chunk_ffield;
+
+    if(NULL == (ctx->chunk_lfield_map = kh_init(idvec)))
+        goto fail_chunk_lfield;
+
+    if(NULL == (ctx->chunk_detour_map = kh_init(idvec)))
+        goto fail_chunk_detour;
+
+    if(NULL == (ctx->flow_stale = kh_init(stale)))
+        goto fail_flow_stale;
+
+    if(NULL == (ctx->los_stale = kh_init(stale)))
+        goto fail_los_stale;
+
+    ctx->tick = 0;
+    memset(&ctx->perfstats, 0, sizeof(ctx->perfstats));
+    return true;
+
+fail_los_stale:
+    kh_destroy(stale, ctx->flow_stale);
+fail_flow_stale:
+    kh_destroy(idvec, ctx->chunk_detour_map);
+fail_chunk_detour:
+    kh_destroy(idvec, ctx->chunk_lfield_map);
+fail_chunk_lfield:
+    kh_destroy(idvec, ctx->chunk_ffield_map);
+fail_chunk_ffield:
+    lru_grid_path_destroy(&ctx->grid_path_cache);
+fail_grid_path:
+    lru_ffid_destroy(&ctx->ffid_cache);
+fail_ffid:
+    lru_flow_destroy(&ctx->flow_cache);
+fail_flow:
+    lru_los_destroy(&ctx->los_cache);
+fail_los:
+    return false;
+}
+
+void N_FC_Destroy(struct fieldcache_ctx *ctx)
+{
+    lru_los_destroy(&ctx->los_cache);
+    lru_flow_destroy(&ctx->flow_cache);
+    lru_ffid_destroy(&ctx->ffid_cache);
+    lru_grid_path_destroy(&ctx->grid_path_cache);
+
+    destroy_all_entries(ctx->chunk_ffield_map);
+    kh_destroy(idvec, ctx->chunk_ffield_map);
+
+    destroy_all_entries(ctx->chunk_lfield_map);
+    kh_destroy(idvec, ctx->chunk_lfield_map);
+
+    destroy_all_entries(ctx->chunk_detour_map);
+    kh_destroy(idvec, ctx->chunk_detour_map);
+
+    kh_destroy(stale, ctx->flow_stale);
+    kh_destroy(stale, ctx->los_stale);
+}
+
+void N_FC_ClearAll(struct fieldcache_ctx *ctx)
+{
+    lru_los_clear(&ctx->los_cache);
+    lru_flow_clear(&ctx->flow_cache);
+    lru_ffid_clear(&ctx->ffid_cache);
+    lru_grid_path_clear(&ctx->grid_path_cache);
+
+    destroy_all_entries(ctx->chunk_ffield_map);
+    kh_clear(idvec, ctx->chunk_ffield_map);
+
+    destroy_all_entries(ctx->chunk_lfield_map);
+    kh_clear(idvec, ctx->chunk_lfield_map);
+
+    destroy_all_entries(ctx->chunk_detour_map);
+    kh_clear(idvec, ctx->chunk_detour_map);
+
+    kh_clear(stale, ctx->flow_stale);
+    kh_clear(stale, ctx->los_stale);
+}
+
+void N_FC_ClearStats(struct fieldcache_ctx *ctx)
+{
+    memset(&ctx->perfstats, 0, sizeof(ctx->perfstats));
+}
+
+void N_FC_GetStats(struct fieldcache_ctx *ctx, struct fc_stats *out_stats)
+{
+    out_stats->los_used = ctx->los_cache.used;
+    out_stats->los_max = ctx->los_cache.capacity;
+    out_stats->los_hit_rate = !ctx->perfstats.los_query ? 0
+        : ((float)ctx->perfstats.los_hit) / ctx->perfstats.los_query;
+    out_stats->los_invalidated = ctx->perfstats.los_invalidated;
+
+    out_stats->flow_used = ctx->flow_cache.used;
+    out_stats->flow_max = ctx->flow_cache.capacity;
+    out_stats->flow_hit_rate = !ctx->perfstats.flow_query ? 0
+        : ((float)ctx->perfstats.flow_hit) / ctx->perfstats.flow_query;
+    out_stats->flow_invalidated = ctx->perfstats.flow_invalidated;
+
+    out_stats->ffid_used = ctx->ffid_cache.used;
+    out_stats->ffid_max = ctx->ffid_cache.capacity;
+    out_stats->ffid_hit_rate = !ctx->perfstats.ffid_hit ? 0
+        : ((float)ctx->perfstats.ffid_hit) / ctx->perfstats.ffid_query;
+
+    out_stats->grid_path_used = ctx->grid_path_cache.used;
+    out_stats->grid_path_max = ctx->grid_path_cache.capacity;
+    out_stats->grid_path_hit_rate = !ctx->perfstats.grid_path_hit ? 0
+        : ((float)ctx->perfstats.grid_path_hit) / ctx->perfstats.grid_path_query;
+}
+
+void N_FC_AddFlowSamples(struct fieldcache_ctx *ctx, unsigned query, unsigned hit)
+{
+    FC_ASSERT_NAV_TASK();
+    ctx->perfstats.flow_query += query;
+    ctx->perfstats.flow_hit   += hit;
+}
+
+void N_FC_AddLosSamples(struct fieldcache_ctx *ctx, unsigned query, unsigned hit)
+{
+    FC_ASSERT_NAV_TASK();
+    ctx->perfstats.los_query += query;
+    ctx->perfstats.los_hit   += hit;
+}
+
+bool N_FC_ContainsLOSField(struct fieldcache_ctx *ctx, dest_id_t id, 
+                           struct coord chunk_coord)
+{
+    FC_ASSERT_NAV_TASK();
+    uint64_t key = key_for_dest_and_chunk(id, chunk_coord);
+    return lru_los_contains(&ctx->los_cache, key);
+}
+
+const struct LOS_field *N_FC_LOSFieldAt(struct fieldcache_ctx *ctx, dest_id_t id, 
+                                        struct coord chunk_coord)
+{
+    FC_ASSERT_NAV_TASK();
+    uint64_t key = key_for_dest_and_chunk(id, chunk_coord);
+    return lru_los_at(&ctx->los_cache, key);
+}
+
+void N_FC_PutLOSField(struct fieldcache_ctx *ctx, dest_id_t id,
+                      struct coord chunk_coord, const struct LOS_field *lf)
+{
+    FC_ASSERT_NAV_TASK();
+    uint64_t key = key_for_dest_and_chunk(id, chunk_coord);
+    lru_los_put(&ctx->los_cache, key, lf);
+
+    khiter_t s = kh_get(stale, ctx->los_stale, key);
+    if(s != kh_end(ctx->los_stale)) {
+        kh_del(stale, ctx->los_stale, s);
+    }
+
+    field_map_add(ctx->chunk_lfield_map, key_for_chunk(chunk_coord), key);
+}
+
+bool N_FC_ContainsFlowField(struct fieldcache_ctx *ctx, ff_id_t ffid)
+{
+    FC_ASSERT_NAV_TASK();
+    /* Peek: a membership probe must not splice the LRU list; recency is
+     * bumped by the actual reads (N_FC_FlowFieldAt). This runs per unit per
+     * tick on the async-field request path.
+     */
+    return (lru_flow_peek(&ctx->flow_cache, ffid) != NULL);
+}
+
+void N_FC_TickAdvance(struct fieldcache_ctx *ctx)
+{
+    FC_ASSERT_NAV_TASK();
+    ctx->tick++;
+}
+
+bool N_FC_FlowFieldRebuildDue(struct fieldcache_ctx *ctx, ff_id_t ffid)
+{
+    FC_ASSERT_NAV_TASK();
+    khiter_t s = kh_get(stale, ctx->flow_stale, ffid);
+    if(s == kh_end(ctx->flow_stale))
+        return false;
+    /* A marked field dropped behind our back (LRU, through-chunk sweep)
+     * leaves an orphaned mark; absence already forces a build. */
+    if(lru_flow_peek(&ctx->flow_cache, ffid) == NULL) {
+        kh_del(stale, ctx->flow_stale, s);
+        return false;
+    }
+    return ctx->tick >= kh_val(ctx->flow_stale, s);
+}
+
+void N_FC_MarkFlowFieldStale(struct fieldcache_ctx *ctx, ff_id_t ffid)
+{
+    FC_ASSERT_NAV_TASK();
+    flow_mark_stale(ctx, ffid, SURROGATE_REBUILD_PERIOD_TICKS);
+}
+
+const struct flow_field *N_FC_FlowFieldAt(struct fieldcache_ctx *ctx, ff_id_t ffid)
+{
+    FC_ASSERT_NAV_TASK();
+    return lru_flow_at(&ctx->flow_cache, ffid);
+}
+
+void N_FC_PutFlowField(struct fieldcache_ctx *ctx, ff_id_t ffid, 
+                       const struct flow_field *ff)
+{
+    FC_ASSERT_NAV_TASK();
+    lru_flow_put(&ctx->flow_cache, ffid, ff);
+
+    khiter_t s = kh_get(stale, ctx->flow_stale, ffid);
+    if(s != kh_end(ctx->flow_stale)) {
+        kh_del(stale, ctx->flow_stale, s);
+    }
+
+    struct coord chunk = (struct coord){(ffid >> 8) & 0xff, ffid & 0xff};
+    field_map_add(ctx->chunk_ffield_map, key_for_chunk(chunk), ffid);
+}
+
+bool N_FC_GetDestFFMapping(struct fieldcache_ctx *ctx, dest_id_t id, 
+                           struct coord chunk_coord, ff_id_t *out_ff)
+{
+    FC_ASSERT_NAV_TASK();
+    uint64_t key = key_for_dest_and_chunk(id, chunk_coord);
+    bool ret = lru_ffid_get(&ctx->ffid_cache, key, out_ff);
+
+    ctx->perfstats.ffid_query++;
+    ctx->perfstats.ffid_hit += !!ret;
+    return ret;
+}
+
+const struct LOS_field *N_FC_PeekLOSField(struct fieldcache_ctx *ctx, dest_id_t id,
+                                          struct coord chunk_coord)
+{
+    return lru_los_peek(&ctx->los_cache, key_for_dest_and_chunk(id, chunk_coord));
+}
+
+bool N_FC_DestLOSRebuildDue(struct fieldcache_ctx *ctx, dest_id_t id,
+                            struct coord chunk_coord)
+{
+    /* Pure read, callable from the parallel peek like N_FC_PeekLOSField;
+     * orphaned marks are cleared on the next put or eviction. */
+    khiter_t s = kh_get(stale, ctx->los_stale, key_for_dest_and_chunk(id, chunk_coord));
+    if(s == kh_end(ctx->los_stale))
+        return false;
+    return ctx->tick >= kh_val(ctx->los_stale, s);
+}
+
+const struct flow_field *N_FC_PeekFlowField(struct fieldcache_ctx *ctx, ff_id_t ffid)
+{
+    return lru_flow_peek(&ctx->flow_cache, ffid);
+}
+
+bool N_FC_PeekDestFFMapping(struct fieldcache_ctx *ctx, dest_id_t id,
+                            struct coord chunk_coord, ff_id_t *out_ff)
+{
+    const ff_id_t *p = lru_ffid_peek(&ctx->ffid_cache, key_for_dest_and_chunk(id, chunk_coord));
+    if(!p)
+        return false;
+    *out_ff = *p;
+    return true;
+}
+
+void N_FC_PutDestFFMapping(struct fieldcache_ctx *ctx, dest_id_t dest_id, 
+                           struct coord chunk_coord, ff_id_t ffid)
+{
+    FC_ASSERT_NAV_TASK();
+    uint64_t key = key_for_dest_and_chunk(dest_id, chunk_coord);
+    lru_ffid_put(&ctx->ffid_cache, key, &ffid);
+}
+
+bool N_FC_GetGridPath(struct fieldcache_ctx *ctx, struct coord local_start, 
+                      struct coord local_dest, struct coord chunk, enum nav_layer layer, 
+                      struct grid_path_desc *out)
+{
+    /* The grid-path cache is a main-thread domain (portal construction and the
+     * portal debug overlay); the navigation task never touches it, so it is not
+     * subject to FC_ASSERT_NAV_TASK like the LOS/flow/ffid caches. */
+    uint64_t key = grid_path_key(local_start, local_dest, chunk, layer);
+    bool ret = lru_grid_path_get(&ctx->grid_path_cache, key, out);
+
+    ctx->perfstats.grid_path_query++;
+    ctx->perfstats.grid_path_hit += !!ret;
+    return ret;
+}
+
+void N_FC_PutGridPath(struct fieldcache_ctx *ctx, struct coord local_start, 
+                      struct coord local_dest, struct coord chunk, enum nav_layer layer, 
+                      const struct grid_path_desc *in)
+{
+    uint64_t key = grid_path_key(local_start, local_dest, chunk, layer);
+    lru_grid_path_put(&ctx->grid_path_cache, key, in);
+}
+
+void N_FC_InvalidateAllAtChunk(struct fieldcache_ctx *ctx, struct coord chunk, enum nav_layer layer)
+{
+    FC_ASSERT_NAV_TASK();
+    /* Note that chunk:field maps simply maintain a list of cache keys for 
+     * which entries were set. The entries for these keys may have already 
+     * been evicted. As well, keys for which data has been overwritten may
+     * appear multiple times. So, not all the fields in the lists will
+     * necessarily be in the caches. */
+
+    uint64_t key = key_for_chunk(chunk);
+    clear_chunk_los_map(ctx, key, layer);
+    clear_chunk_flow_map(ctx, key, layer, -1);
+}
+
+void N_FC_InvalidateZoneFieldsAtChunk(struct fieldcache_ctx *ctx, struct coord chunk,
+                                      enum nav_layer layer)
+{
+    FC_ASSERT_NAV_TASK();
+    clear_chunk_flow_map(ctx, key_for_chunk(chunk), layer, TARGET_ZONE);
+}
+
+void N_FC_InvalidateAllThroughChunk(struct fieldcache_ctx *ctx, struct coord chunk, enum nav_layer layer)
+{
+    FC_ASSERT_NAV_TASK();
+    assert(Sched_UsingBigStack());
+
+    dest_id_t paths[CONFIG_FLOW_CACHE_SZ];
+    size_t npaths = 0;
+
+    uint64_t key;
+    ff_id_t ffid_val;
+
+    /* Make sure not to actually query the caches, in order to not mess up the age history */
+    /* First find all the paths going through the chunk. */
+    LRU_FOREACH_SAFE_REMOVE(ffid, &ctx->ffid_cache, key, ffid_val, {
+
+        (void)ffid_val;
+        dest_id_t curr_dest = key_dest(key);
+        struct coord curr_chunk = key_chunk(key);
+
+        if(N_DestLayer(curr_dest) != layer)
+            continue;
+
+        if(0 == memcmp(&curr_chunk, &chunk, sizeof(chunk))
+        && !dest_array_contains(paths, npaths, curr_dest)) {
+
+            paths[npaths++] = curr_dest;
+        }
+    });
+
+    /* Now that we know all the paths, find and remove all the flow 
+     * fields belonging to them */
+    struct flow_field ff_val;
+    LRU_FOREACH_SAFE_REMOVE(flow, &ctx->flow_cache, key, ff_val, {
+    
+        (void)ff_val;
+        dest_id_t curr_dest = key_dest(key);
+
+        if(dest_array_contains(paths, npaths, curr_dest)) {
+        
+            bool found = lru_flow_remove(&ctx->flow_cache, key);
+            ctx->perfstats.flow_invalidated += !!found;
+        }
+    });
+
+    /* And remove all the LOS fields as well */
+    struct LOS_field los_val;
+    LRU_FOREACH_SAFE_REMOVE(los, &ctx->los_cache, key, los_val, {
+
+        (void)los_val;
+        dest_id_t curr_dest = key_dest(key);
+
+        if(dest_array_contains(paths, npaths, curr_dest)) {
+        
+            bool found = lru_los_remove(&ctx->los_cache, key);
+            ctx->perfstats.los_invalidated += !!found;
+        }
+    });
+}
+
+void N_FC_RegisterDetour(struct fieldcache_ctx *ctx, dest_id_t id, const struct coord *chunks,
+                         size_t nchunks)
+{
+    FC_ASSERT_NAV_TASK();
+    for(int i = 0; i < nchunks; i++) {
+        field_map_add(ctx->chunk_detour_map, key_for_chunk(chunks[i]), id);
+    }
+}
+
+void N_FC_MarkDetoursOpened(struct fieldcache_ctx *ctx, struct coord chunk, enum nav_layer layer)
+{
+    FC_ASSERT_NAV_TASK();
+    khiter_t k = kh_get(idvec, ctx->chunk_detour_map, key_for_chunk(chunk));
+    if(k == kh_end(ctx->chunk_detour_map))
+        return;
+    const vec_id_t *dests = &kh_val(ctx->chunk_detour_map, k);
+
+    uint64_t key;
+    ff_id_t ffid_val;
+    LRU_FOREACH_SAFE_REMOVE(ffid, &ctx->ffid_cache, key, ffid_val, {
+
+        dest_id_t curr_dest = key_dest(key);
+        if(N_DestLayer(curr_dest) == layer && id_vec_contains(dests, curr_dest)) {
+            flow_mark_stale(ctx, ffid_val, POINT_SEEK_REBUILD_PERIOD_TICKS);
+        }
+    });
+}
+
+size_t N_FC_InvalidateNeighbourEnemySeekFields(struct fieldcache_ctx *ctx, int width, int height,
+                                               struct coord chunk, enum nav_layer layer)
+{
+    FC_ASSERT_NAV_TASK();
+    size_t ret = 0;
+    for(int dr = -1; dr <= +1; dr++) {
+    for(int dc = -1; dc <= +1; dc++) {
+
+        if(dr == 0 && dc == 0)
+            continue;
+
+        int abs_r = chunk.r + dr;
+        int abs_c = chunk.c + dc;
+
+        if(abs_r < 0 || abs_r >= height)
+            continue;
+        if(abs_c < 0 || abs_c >= width)
+            continue;
+
+        struct coord curr = (struct coord){abs_r, abs_c};
+        uint64_t key = key_for_chunk(curr);
+        ret += clear_chunk_flow_map(ctx, key, layer, TARGET_ENEMIES);
+    }}
+    return ret;
+}
+
+size_t N_FC_InvalidateDynamicSurroundFields(struct fieldcache_ctx *ctx)
+{
+    FC_ASSERT_NAV_TASK();
+    size_t ret = 0;
+    uint64_t key;
+    struct flow_field ff_val;
+
+    LRU_FOREACH_SAFE_REMOVE(flow, &ctx->flow_cache, key, ff_val, {
+
+        int type = N_FlowFieldTargetType(key);
+        if(type != TARGET_ENTITY)
+            continue;
+
+        uint32_t ent = ff_val.target.ent.target;
+        if(!G_EntityExists(ent)) {
+            lru_flow_remove(&ctx->flow_cache, key);
+            ret++;
+            continue;
+        }
+        if(!(G_FlagsGet(ent) & ENTITY_FLAG_MOVABLE))
+            continue;
+
+        /* A field whose target has stayed within its tile still guides to the
+         * same footprint; keep it, bounded by an age cap so crowd-induced
+         * staleness cannot persist indefinitely.
+         */
+        vec2_t curr = G_Pos_GetXZ(ent);
+        vec2_t built = ff_val.target.ent.built_pos;
+        bool moved = fabsf(curr.x - built.x) >= X_COORDS_PER_TILE
+                  || fabsf(curr.z - built.z) >= Z_COORDS_PER_TILE;
+
+        if(!moved && ff_val.target.ent.age < SURROUND_FIELD_MAX_AGE) {
+            /* Single-owner context: bump the age in the stored entry */
+            struct flow_field *stored =
+                (struct flow_field*)lru_flow_peek(&ctx->flow_cache, key);
+            assert(stored);
+            stored->target.ent.age++;
+            continue;
+        }
+
+        lru_flow_remove(&ctx->flow_cache, key);
+        ret++;
+    });
+    return ret;
+}
+
+struct fieldcache_ctx *N_FC_New(void)
+{
+    return PF_MALLOC(sizeof(struct fieldcache_ctx));
+}
+
+void N_FC_Free(struct fieldcache_ctx *ctx)
+{
+    assert(ctx);
+    PF_FREE(ctx);
+}
+
+void N_FC_SetNavTaskTIDProvider(uint32_t (*provider)(void))
+{
+    s_nav_task_tid_provider = provider;
+}
+
+uint32_t N_FC_NavTaskTID(void)
+{
+    return s_nav_task_tid_provider ? s_nav_task_tid_provider() : NULL_TID;
+}
+
+bool N_FC_InitSingleton(void)
+{
+    if(s_singleton)
+        return true;
+    if(NULL == (s_singleton = N_FC_New()))
+        return false;
+    if(!N_FC_Init(s_singleton)) {
+        N_FC_Free(s_singleton);
+        s_singleton = NULL;
+        return false;
+    }
+    return true;
+}
+
+void N_FC_ShutdownSingleton(void)
+{
+    if(!s_singleton)
+        return;
+    N_FC_Destroy(s_singleton);
+    N_FC_Free(s_singleton);
+    s_singleton = NULL;
+}
+
+struct fieldcache_ctx *N_FC_GetSingleton(void)
+{
+    return s_singleton;
+}
+
