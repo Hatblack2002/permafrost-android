@@ -69,4 +69,19 @@ check("precision highp samplerBuffer;" in skinned,
 check("uniform samplerBuffer posebuff;" in skinned,
       "skinned vertex shader must retain the pose buffer declaration")
 
+
+# Every transformed shader must put the GLES profile directive on line one.
+# This catches literal \\n output and comments accidentally preceding #version.
+for stage_dir in ("vertex", "fragment", "geometry", "compute"):
+    stage_path = ROOT / "engine" / "shaders" / stage_dir
+    if not stage_path.exists():
+        continue
+    for path in sorted(stage_path.glob("*.glsl")):
+        transformed = MODULE.transform(path.read_text(encoding="utf-8"), stage_dir + "/" + path.name)
+        lines = transformed.splitlines()
+        check(bool(lines) and lines[0] == "#version 320 es",
+              stage_dir + "/" + path.name + ": #version 320 es must be the first line")
+        check("\\\\n" not in lines[0],
+              stage_dir + "/" + path.name + ": version directive contains literal escaped newline")
+
 print("GLES shader clip-varying regression checks passed.")
