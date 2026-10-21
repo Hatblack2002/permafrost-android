@@ -69,6 +69,38 @@ def is_vertex(path: str) -> bool:
     return "/vertex/" in norm or norm.startswith("vertex/")
 
 
+def insert_after_glsl_preamble(text: str, declaration: str) -> str:
+    """Insert interface declarations after #version, #extension and precision statements.
+
+    GLSL ES requires default precision declarations before declarations that
+    depend on them. Keep extension directives ahead of ordinary GLSL tokens.
+    """
+    lines = text.splitlines(keepends=True)
+    version_idx = next(
+        (i for i, line in enumerate(lines) if re.match(r"\s*#version\b", line)),
+        None,
+    )
+    if version_idx is None:
+        raise ValueError("shader has no #version directive")
+
+    insert_idx = version_idx + 1
+    while insert_idx < len(lines):
+        stripped = lines[insert_idx].strip()
+        if (
+            not stripped
+            or stripped.startswith("#extension")
+            or re.match(r"precision\s+\w+\s+\w+\s*;", stripped)
+        ):
+            insert_idx += 1
+            continue
+        break
+
+    prefix = "".join(lines[:insert_idx])
+    if prefix and not prefix.endswith("\n"):
+        prefix += "\n"
+    return prefix + declaration.lstrip("\n") + "\n" + "".join(lines[insert_idx:])
+
+
 def transform(text: str, fname: str) -> str:
     # 1. version rewrite
     text = re.sub(r"#version\s+330\s+core", "#version 320 es", text)
@@ -83,9 +115,7 @@ def transform(text: str, fname: str) -> str:
 
     # 3. clip distance emulation
     if is_vertex(fname) and "gl_ClipDistance" in text:
-        idx = text.index("#version 320 es")
-        eol = text.index("\n", idx)
-        text = text[: eol + 1] + VERT_CLIP_DECL + text[eol + 1 :]
+        text = insert_after_glsl_preamble(text, VERT_CLIP_DECL)
         text = re.sub(
             r"gl_ClipDistance\s*\[\s*0\s*\]\s*=",
             "pf_clip0 =",
@@ -100,9 +130,7 @@ def transform(text: str, fname: str) -> str:
             )
 
     if is_fragment(fname) and os.path.basename(fname) in CLIP_CONSUMER_FRAGS:
-        idx = text.index("#version 320 es")
-        eol = text.index("\n", idx)
-        text = text[: eol + 1] + FRAG_CLIP_DECL + text[eol + 1 :]
+        text = insert_after_glsl_preamble(text, FRAG_CLIP_DECL)
         # Discard right after the opening of main().
         m = re.search(r"void\s+main\s*\(\s*\)\s*\{", text)
         if not m:
