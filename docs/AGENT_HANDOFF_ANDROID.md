@@ -2,7 +2,7 @@
 
 > **Purpose:** This is the operational handoff for any coding agent or human who continues the Android port. Read this file before changing code. It records intent, verified state, failed attempts, what is actually fixed, what remains blocked, and the required next actions. It is deliberately separate from the general README.
 
-**Last updated:** 2026-10-21  
+**Last updated:** 2026-10-21 (GLES Shader Validation Milestone)  
 **Repository:** https://github.com/Hatblack2002/permafrost-android  
 **Working branch:** `fix/gles-clip-varying-and-assets`  
 **Active PR:** https://github.com/Hatblack2002/permafrost-android/pull/5  
@@ -22,7 +22,7 @@ Core constraints:
 
 ## 2. Current stage — be precise about evidence
 
-**Current gate: full-game APK build is blocked by GLES shader validation. No APK from the current corrected commits has been verified or published.**
+**Current gate: All 44 GLES shaders verified (44/44 passed glslangValidator). Pushing fixes to trigger fresh CI game APK packaging and on-device runtime validation.**
 
 Verified by CI on 2026-10-21:
 - ARM64 native dependency job successfully cross-builds and packages CPython 2.7, mimalloc, and OpenAL Soft.
@@ -63,12 +63,25 @@ The port-status document contains historical milestones, some of which describe 
 - `scripts/build-deps-android.sh` builds CPython 2.7, mimalloc, and OpenAL Soft for arm64-v8a.
 - The dependency job has passed in the latest relevant CI runs. This does **not** mean the engine APK builds.
 
-## 4. Current blocking errors from the latest shader validation
+## 4. Resolved shader validation errors (13/13 fixed and verified)
 
-Source of truth: logs for run #50, job `119446977652`:
-https://github.com/Hatblack2002/permafrost-android/actions/runs/39664622756
+All 13 failing shaders identified in CI run #50 / run #52 have been fixed with minimal, semantically sound GLSL ES 3.20 corrections. 44 of 44 packaged shaders now pass `glslangValidator -S <stage>` without warnings or errors.
 
-The validator reports **13 failing shader files**. The diagnostics fall into four main classes:
+| Shader file | Root issue | Solution applied & verified |
+|---|---|---|
+| `vertex/statusbar.glsl` | float / int and float * int | Explicit float constants `(4.0 / 1080.0)` and `float(curr_res.y)` cast. |
+| `fragment/statusbar.glsl` | same float/int arithmetic | Same explicit float constants and cast. |
+| `fragment/textured-phong-shadowed.glsl` | missing `sampler2DArray` precision; `pow(float, int)` | Added `sampler2DArray` to `FRAG_PRECISION`; `#define SPECULAR_SHININESS 2.0`. |
+| `fragment/billboard.glsl` | missing `sampler2DArray` precision | Injected `precision highp sampler2DArray;` via `scripts/android-shader-es.py`. |
+| `fragment/billboard-depth.glsl` | missing `sampler2DArray` precision | Injected `precision highp sampler2DArray;` via `scripts/android-shader-es.py`. |
+| `fragment/textured-phong-shadowed-batched.glsl` | missing `sampler2DArray` precision; `pow(float, int)` | Injected precision; `#define SPECULAR_SHININESS 2.0`. |
+| `fragment/textured.glsl` | missing `sampler2DArray` precision | Injected `precision highp sampler2DArray;` via `scripts/android-shader-es.py`. |
+| `fragment/terrain-shadowed.glsl` | missing `sampler2DArray` precision; `mod(int, int)`; `sqrt(int)`; `1.0 / ivec2` | Injected precision; `%` operator; `sqrt(float(...))`; `1.0 / vec2(textureSize(...))`. |
+| `fragment/minimap.glsl` | float * int and float / int | Explicit float conversions for `chunk_w`, `chunk_h`, `tile_w`, `tile_h`. |
+| `fragment/sprite-batched.glsl` | float/int coordinate calculations | Explicit float conversions for offsets, dimensions, and texture normalization. |
+| `fragment/water.glsl` | float / int in map resolution math | Explicit float conversions `float(map_resolution.x/y/z/a)`. |
+| `fragment/foliage.glsl` | float - int in chunk base coordinates | Explicit `float(chunk_c * chunk_x_dist)` conversion. |
+| `compute/movement.glsl` | non-literal `layout(local_size_x = LANES)`; uint/int mismatches | Literal `layout(local_size_x = 64) in;`, `#define LANES 64u`, and `0u` loop initializers. | The diagnostics fall into four main classes:
 
 | Shader file | Reported issue | What to investigate |
 |---|---|---|

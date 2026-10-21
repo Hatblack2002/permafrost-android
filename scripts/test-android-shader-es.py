@@ -84,4 +84,23 @@ for stage_dir in ("vertex", "fragment", "geometry", "compute"):
         check("\\\\n" not in lines[0],
               stage_dir + "/" + path.name + ": version directive contains literal escaped newline")
 
+# Assert fragment shader precision covers sampler2DArray and shadow samplers
+billboard = MODULE.transform(source("fragment", "billboard.glsl"), "fragment/billboard.glsl")
+check("precision highp sampler2DArray;" in billboard,
+      "fragment shaders must declare default precision for sampler2DArray")
+check("precision highp sampler2DShadow;" in billboard,
+      "fragment shaders must declare default precision for sampler2DShadow")
+
+# Assert compute shader layout qualifier uses an integer literal
+movement = MODULE.transform(source("compute", "movement.glsl"), "compute/movement.glsl")
+check("layout(local_size_x = 64) in;" in movement,
+      "compute movement shader must declare local_size_x with an integer literal")
+check("#define LANES 64u" in movement,
+      "compute movement shader must define LANES as 64u for strict GLES unsigned loop math")
+
+# Assert statusbar shaders use float arithmetic
+statusbar_vert = MODULE.transform(source("vertex", "statusbar.glsl"), "vertex/statusbar.glsl")
+check("(4.0 / 1080.0) * float(curr_res.y)" in statusbar_vert,
+      "statusbar vertex shader must use float division and cast curr_res.y")
+
 print("GLES shader clip-varying regression checks passed.")

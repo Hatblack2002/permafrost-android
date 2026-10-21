@@ -229,7 +229,7 @@ uvec4 fetch_safe(usamplerBuffer buff, int idx)
     int batch_size = map_resolution[0] * map_resolution[1] * map_resolution[2] * map_resolution[3];
     int buff_size = textureSize(buff);
     int begin_idx = visbuff_offset;
-    int end_idx = int(mod(visbuff_offset + batch_size, buff_size));
+    int end_idx = (visbuff_offset + batch_size) % buff_size;
 
     if(end_idx > begin_idx) {
         idx = clamp(idx, begin_idx, end_idx-1);
@@ -422,9 +422,9 @@ float splat_alpha_at_pos(vec3 ws_pos)
     float percentu = clamp((chunk_base_x - ws_pos.x) / float(chunk_x_dist), 0.0, 1.0);
     float percentv = clamp((ws_pos.z - chunk_base_z) / float(chunk_z_dist), 0.0, 1.0);
 
-    int res = int(sqrt(textureSize(splat_map)));
-    int buffx = int(percentu * (res - 1));
-    int buffy = int(percentv * (res - 1));
+    int res = int(sqrt(float(textureSize(splat_map))));
+    int buffx = int(percentu * float(res - 1));
+    int buffy = int(percentv * float(res - 1));
     int idx = clamp(buffx * res + buffy, 0, res * res - 1);
 
     return clamp(texelFetch(splat_map, idx).r + 0.2, 0.0, 1.0);
@@ -525,7 +525,7 @@ float shadow_factor_pcf(vec4 light_space_pos)
         return 0.0;
 
     float shadow = 0.0;
-    vec2 texel_size = 1.0 / textureSize(shadow_map, 0);
+    vec2 texel_size = 1.0 / vec2(textureSize(shadow_map, 0));
     float current_depth = proj_coords.z;
 
     for(int x = -1; x <= 1; x++) {
@@ -590,9 +590,9 @@ float height_at_pos(vec3 ws_pos)
     float percentu = clamp((chunk_base_x - ws_pos.x) / float(chunk_x_dist), 0.0, 1.0);
     float percentv = clamp((ws_pos.z - chunk_base_z) / float(chunk_z_dist), 0.0, 1.0);
 
-    int res = int(sqrt(textureSize(height_map)));
-    int buffx = int(percentu * (res - 1));
-    int buffy = int(percentv * (res - 1));
+    int res = int(sqrt(float(textureSize(height_map))));
+    int buffx = int(percentu * float(res - 1));
+    int buffy = int(percentv * float(res - 1));
     int idx = clamp(buffx * res + buffy, 0, res * res - 1);
 
     return texelFetch(height_map, idx).r;
@@ -618,9 +618,9 @@ vec3 normal_at_pos(vec3 ws_pos)
     float percentu = clamp((chunk_base_x - ws_pos.x) / float(chunk_x_dist), 0.0, 1.0);
     float percentv = clamp((ws_pos.z - chunk_base_z) / float(chunk_z_dist), 0.0, 1.0);
 
-    int res = int(sqrt(textureSize(height_map)));
-    int buffx = int(percentu * (res - 1));
-    int buffy = int(percentv * (res - 1));
+    int res = int(sqrt(float(textureSize(height_map))));
+    int buffx = int(percentu * float(res - 1));
+    int buffy = int(percentv * float(res - 1));
     int idx = clamp(buffx * res + buffy, 0, res * res - 1);
 
     /* Compute the derivative at the point using the finite difference approximation

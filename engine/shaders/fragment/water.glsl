@@ -182,10 +182,10 @@ float bilinear_interp_unit_square(float tl, float tr, float bl, float br, vec2 c
 
 vec2 local_uv(vec2 global_uv)
 {
-    float x_per_chunk = 1.0 / map_resolution.x;
-    float z_per_chunk = 1.0 / map_resolution.y;
-    float x_per_tile = x_per_chunk / map_resolution.z;
-    float z_per_tile = z_per_chunk / map_resolution.a;
+    float x_per_chunk = 1.0 / float(map_resolution.x);
+    float z_per_chunk = 1.0 / float(map_resolution.y);
+    float x_per_tile = x_per_chunk / float(map_resolution.z);
+    float z_per_tile = z_per_chunk / float(map_resolution.a);
 
     /* convert to range [0, 1] for the entire map */
     global_uv /= -water_tiling;

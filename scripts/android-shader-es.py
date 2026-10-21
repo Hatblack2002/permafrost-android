@@ -44,6 +44,9 @@ precision highp sampler2D;
 precision highp samplerCube;
 precision highp samplerBuffer;
 precision highp usamplerBuffer;
+precision highp sampler2DArray;
+precision highp sampler2DShadow;
+precision highp sampler2DArrayShadow;
 """
 
 # GLSL ES does not provide default precision for opaque buffer samplers in
