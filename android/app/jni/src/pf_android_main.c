@@ -586,6 +586,9 @@ int SDL_main(int argc, char *argv[])
         basepath, script_path);
 
     int ret = pf_engine_main(3, eargv);
+    fflush(stdout);
+    fflush(stderr);
+    SDL_Delay(300);
     bb_putf("pf-android: engine returned %d", ret);
 
     if(ret != 0) {
