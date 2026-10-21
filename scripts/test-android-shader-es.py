@@ -63,4 +63,10 @@ for name in ("terrain-shadowed.glsl", "terrain.glsl"):
         check("#define TERRAIN_BAKED" not in output and "#define TERRAIN_BAKE_SRC" not in output,
               stage + "/" + name + ": engine-injected TERRAIN_* macros must not be defaulted")
 
+skinned = MODULE.transform(source("vertex", "skinned.glsl"), "vertex/skinned.glsl")
+check("precision highp samplerBuffer;" in skinned,
+      "skinned vertex shader must declare samplerBuffer precision for GLES")
+check("uniform samplerBuffer posebuff;" in skinned,
+      "skinned vertex shader must retain the pose buffer declaration")
+
 print("GLES shader clip-varying regression checks passed.")
