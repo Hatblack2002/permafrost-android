@@ -22,7 +22,20 @@ Core constraints:
 
 ## 2. Current stage — be precise about evidence
 
-**Current gate: All 44 GLES shaders verified (44/44 passed glslangValidator). Pushing fixes to trigger fresh CI game APK packaging and on-device runtime validation.**
+**Current gate: Full-Game APK Successfully Built and Verified in CI (Run #53, Commit `279866f`). Ready for On-Device Deployment and Boot Verification on Samsung Galaxy S21 FE 5G.**
+
+### Verified by CI on 2026-10-21:
+- **Workflow Run #53:** https://github.com/Hatblack2002/permafrost-android/actions/runs/39674660107 (Job conclusion: **SUCCESS**)
+- **Target Commit:** `279866f`
+- **PR #5 Mergeable State:** `clean` (All checks green)
+- **Shader Validation:** All 44 GLES 3.2 shader files passed `glslangValidator` compilation (0 failures).
+- **Game Assets & Python Stdlib:** Packaged pure-Python 2.7 stdlib + RTS game scripts + assets under `pf/`.
+- **Native Link Milestone:** 97 C source files compiled into `libmain.so` (arm64-v8a) with CPython 2.7, mimalloc, and OpenAL Soft.
+- **Export Verification:** `libmain.so` verified to export `SDL_main`.
+- **APK Artifact Published:** `pf-android-game-debug-apk`
+  - Artifact ID: `12381013518`
+  - Size: 118,014,852 bytes (~112.5 MB)
+  - Download: https://github.com/Hatblack2002/permafrost-android/actions/runs/39674660107/artifacts/12381013518
 
 Verified by CI on 2026-10-21:
 - ARM64 native dependency job successfully cross-builds and packages CPython 2.7, mimalloc, and OpenAL Soft.
