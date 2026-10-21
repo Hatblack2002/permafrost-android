@@ -108,6 +108,29 @@ jobs:
           python3 scripts/android-shader-es.py \
             engine/shaders android/app/src/main/assets/pf/shaders
 
+      # Do not ship a build if any packaged shader fails a real GLSL ES
+      # compile. The device driver remains the final runtime check, but this
+      # catches type errors (int/float, mod, clamp, etc.) before APK install.
+      - name: Validate every packaged GLES shader
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y glslang-tools
+          count=0
+          while IFS= read -r -d '' shader; do
+            case "$shader" in
+              */vertex/*) stage=vert ;;
+              */fragment/*) stage=frag ;;
+              */geometry/*) stage=geom ;;
+              */compute/*) stage=comp ;;
+              *) continue ;;
+            esac
+            echo "Validating $shader"
+            glslangValidator -S "$stage" "$shader"
+            count=$((count + 1))
+          done < <(find android/app/src/main/assets/pf/shaders -name '*.glsl' -print0)
+          echo "Validated $count GLES shader files."
+
       # The embedded interpreter resolves PYTHONHOME=<basepath>/scripts
       # and therefore looks for its stdlib under scripts/lib/python2.7.
       # Ship the FULL pure-Python Lib tree (minus dev-only subpackages):
