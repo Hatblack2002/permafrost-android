@@ -154,9 +154,19 @@ def define_undefined_if_identifiers(text: str) -> str:
 
 
 def transform(text: str, fname: str) -> str:
-    # 1. version rewrite
+    # 1. version rewrite. In GLSL ES, #version must precede comments and
+    #    every other token. Desktop engine shaders commonly put a comment
+    #    banner first, so move the version directive to the first line after
+    #    rewriting it; otherwise real GLES compilers reject the shader before
+    #    checking any of its code.
     text = re.sub(r"#version\s+330\s+core", "#version 320 es", text)
     text = re.sub(r"#version\s+430\s+core", "#version 320 es", text)
+    version_match = re.search(r"^\s*#version\s+320\s+es\s*$", text, re.M)
+    if not version_match:
+        raise ValueError("%s has no supported GLSL version directive" % fname)
+    version_line = version_match.group(0).strip()
+    text = text[:version_match.start()] + text[version_match.end():]
+    text = version_line + "\\n" + text.lstrip("\\n")
 
     # 2. precisions for the fragment stage only (vertex/geometry/compute
     #    stages default to highp in GLSL ES).
