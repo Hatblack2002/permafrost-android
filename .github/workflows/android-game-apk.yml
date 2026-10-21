@@ -117,6 +117,9 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y glslang-tools
           count=0
+          failures=0
+          failure_log="$RUNNER_TEMP/gles-shader-failures.txt"
+          : > "$failure_log"
           while IFS= read -r -d '' shader; do
             case "$shader" in
               */vertex/*) stage=vert ;;
@@ -126,10 +129,22 @@ jobs:
               *) continue ;;
             esac
             echo "Validating $shader"
-            glslangValidator -S "$stage" "$shader"
-            count=$((count + 1))
+            if glslangValidator -S "$stage" "$shader"; then
+              count=$((count + 1))
+            else
+              failures=$((failures + 1))
+              {
+                echo "===== $shader ($stage) ====="
+                glslangValidator -S "$stage" "$shader" || true
+                echo
+              } | tee -a "$failure_log"
+            fi
           done < <(find android/app/src/main/assets/pf/shaders -name '*.glsl' -print0)
-          echo "Validated $count GLES shader files."
+          echo "Successfully validated $count GLES shader files."
+          if [ "$failures" -ne 0 ]; then
+            echo "::error::$failures GLES shader(s) failed validation; see diagnostics above."
+            exit 1
+          fi
 
       # The embedded interpreter resolves PYTHONHOME=<basepath>/scripts
       # and therefore looks for its stdlib under scripts/lib/python2.7.
