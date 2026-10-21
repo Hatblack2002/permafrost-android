@@ -90,6 +90,9 @@ jobs:
           test -f android/app/jni/prebuilt/openal/libopenal.a
           cat android/app/jni/prebuilt/BUILD_INFO.txt
 
+      - name: Test GLES shader clip-varying transformation
+        run: python3 scripts/test-android-shader-es.py
+
       # Shaders are transformed from desktop GLSL (330/430 core) to GLES
       # 3.2 at packaging time; the engine sources stay pristine.
       - name: Transform shaders to GLES 3.2
