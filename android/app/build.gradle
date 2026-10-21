@@ -49,6 +49,13 @@ android {
         }
     }
 
+    androidResources {
+        /* The default pattern contains "<dir>_*", which silently drops asset
+         * directories whose names begin with underscores (e.g. Python's
+         * ensurepip/_bundled and plat-mac/_builtinSuites). */
+        ignoreAssetsPattern '!.svn:!.git:!.ds_store:!*.scc:.*:!CVS:!thumbs.db:!picasa.ini:!*~'
+    }
+
     lint {
         abortOnError false
     }
