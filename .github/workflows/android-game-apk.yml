@@ -165,7 +165,10 @@ jobs:
           SO="$RUNNER_TEMP/pf-libmain.so"
           unzip -p "$APK" lib/arm64-v8a/libmain.so > "$SO"
           test -s "$SO"
-          readelf --dyn-syms --wide "$SO" | grep -E '[[:space:]]SDL_main        uses: actions/upload-artifact@v4
+          readelf --dyn-syms --wide "$SO" | awk '$NF == "SDL_main" && $7 != "UND" { found=1 } END { exit !found }'
+
+      - name: Upload game debug APK artifact
+        uses: actions/upload-artifact@v4
         with:
           name: pf-android-game-debug-apk
           path: android/app/build/outputs/apk/debug/app-debug.apk
