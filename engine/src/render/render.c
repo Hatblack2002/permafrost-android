@@ -900,6 +900,10 @@ SDL_Thread *R_Run(struct render_sync_state *rstate)
      * Certain drivers crap out when trying to make the context in the render thread directly. 
      */
     s_context = SDL_GL_CreateContext(rstate->arg->in_window);
+    if(!s_context) {
+        fprintf(stderr, "SDL_GL_CreateContext failed: %s\n", SDL_GetError());
+        fflush(stderr);
+    }
     SDL_GL_MakeCurrent(rstate->arg->in_window, NULL);
 
     return SDL_CreateThread(render, "render", rstate);
