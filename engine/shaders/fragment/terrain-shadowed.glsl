@@ -165,14 +165,14 @@ ivec4 tile_desc_at(vec3 ws_pos)
     int chunk_x_dist = tile_w * X_COORDS_PER_TILE;
     int chunk_z_dist = tile_h * Z_COORDS_PER_TILE;
 
-    int chunk_r = int(abs(map_pos.y - ws_pos.z) / chunk_z_dist);
-    int chunk_c = int(abs(map_pos.x - ws_pos.x) / chunk_x_dist);
+    int chunk_r = int(abs(map_pos.y - ws_pos.z) / float(chunk_z_dist));
+    int chunk_c = int(abs(map_pos.x - ws_pos.x) / float(chunk_x_dist));
 
-    int chunk_base_x = int(map_pos.x - (chunk_c * chunk_x_dist));
-    int chunk_base_z = int(map_pos.y + (chunk_r * chunk_z_dist));
+    int chunk_base_x = int(map_pos.x - float(chunk_c * chunk_x_dist));
+    int chunk_base_z = int(map_pos.y + float(chunk_r * chunk_z_dist));
 
-    int tile_c = int(abs(chunk_base_x - ws_pos.x) / X_COORDS_PER_TILE);
-    int tile_r = int(abs(chunk_base_z - ws_pos.z) / Z_COORDS_PER_TILE);
+    int tile_c = int(abs(float(chunk_base_x) - ws_pos.x) / float(X_COORDS_PER_TILE));
+    int tile_r = int(abs(float(chunk_base_z) - ws_pos.z) / float(Z_COORDS_PER_TILE));
 
     return ivec4(chunk_r, chunk_c, tile_r, tile_c);
 }
@@ -188,8 +188,8 @@ ivec4 tile_relative_desc(ivec4 desc, int dr, int dc)
     return ivec4(
         abs_r / map_resolution.z,
         abs_c / map_resolution.a,
-        int(mod(abs_r, map_resolution.z)),
-        int(mod(abs_c, map_resolution.a))
+        (abs_r % map_resolution.z),
+        (abs_c % map_resolution.a)
     );
 }
 
@@ -413,14 +413,14 @@ float splat_alpha_at_pos(vec3 ws_pos)
     int chunk_x_dist = tile_w * X_COORDS_PER_TILE;
     int chunk_z_dist = tile_h * Z_COORDS_PER_TILE;
 
-    int chunk_r = int(abs(map_pos.y - ws_pos.z) / chunk_z_dist);
-    int chunk_c = int(abs(map_pos.x - ws_pos.x) / chunk_x_dist);
+    int chunk_r = int(abs(map_pos.y - ws_pos.z) / float(chunk_z_dist));
+    int chunk_c = int(abs(map_pos.x - ws_pos.x) / float(chunk_x_dist));
 
-    float chunk_base_x = map_pos.x - (chunk_c * chunk_x_dist);
-    float chunk_base_z = map_pos.y + (chunk_r * chunk_z_dist);
+    float chunk_base_x = map_pos.x - float(chunk_c * chunk_x_dist);
+    float chunk_base_z = map_pos.y + float(chunk_r * chunk_z_dist);
 
-    float percentu = clamp((chunk_base_x - ws_pos.x) / chunk_x_dist, 0, 1.0);
-    float percentv = clamp((ws_pos.z - chunk_base_z) / chunk_z_dist, 0, 1.0);
+    float percentu = clamp((chunk_base_x - ws_pos.x) / float(chunk_x_dist), 0.0, 1.0);
+    float percentv = clamp((ws_pos.z - chunk_base_z) / float(chunk_z_dist), 0.0, 1.0);
 
     int res = int(sqrt(textureSize(splat_map)));
     int buffx = int(percentu * (res - 1));
@@ -498,9 +498,9 @@ vec4 bilinear_interp_vec4
 float shadow_factor(vec4 light_space_pos)
 {
     vec3 proj_coords = (light_space_pos.xyz / light_space_pos.w) * 0.5 + 0.5;
-    if(proj_coords.x < 0 || proj_coords.x >= textureSize(shadow_map, 0).x)
+    if(proj_coords.x < 0.0 || proj_coords.x >= float(textureSize(shadow_map, 0).x))
         return 0.0;
-    if(proj_coords.y < 0 || proj_coords.y >= textureSize(shadow_map, 0).y)
+    if(proj_coords.y < 0.0 || proj_coords.y >= float(textureSize(shadow_map, 0).y))
         return 0.0;
     if(proj_coords.z > 0.95)
         return 0.0;
@@ -517,9 +517,9 @@ float shadow_factor(vec4 light_space_pos)
 float shadow_factor_pcf(vec4 light_space_pos)
 {
     vec3 proj_coords = (light_space_pos.xyz / light_space_pos.w) * 0.5 + 0.5;
-    if(proj_coords.x < 0 || proj_coords.x >= textureSize(shadow_map, 0).x)
+    if(proj_coords.x < 0.0 || proj_coords.x >= float(textureSize(shadow_map, 0).x))
         return 0.0;
-    if(proj_coords.y < 0 || proj_coords.y >= textureSize(shadow_map, 0).y)
+    if(proj_coords.y < 0.0 || proj_coords.y >= float(textureSize(shadow_map, 0).y))
         return 0.0;
     if(proj_coords.z > 0.95)
         return 0.0;
@@ -549,9 +549,9 @@ float shadow_factor_poisson(vec4 light_space_pos)
     );
 
     vec3 proj_coords = (light_space_pos.xyz / light_space_pos.w) * 0.5 + 0.5;
-    if(proj_coords.x < 0 || proj_coords.x >= textureSize(shadow_map, 0).x)
+    if(proj_coords.x < 0.0 || proj_coords.x >= float(textureSize(shadow_map, 0).x))
         return 0.0;
-    if(proj_coords.y < 0 || proj_coords.y >= textureSize(shadow_map, 0).y)
+    if(proj_coords.y < 0.0 || proj_coords.y >= float(textureSize(shadow_map, 0).y))
         return 0.0;
     if(proj_coords.z > 0.95)
         return 0.0;
@@ -581,14 +581,14 @@ float height_at_pos(vec3 ws_pos)
     int chunk_x_dist = tile_w * X_COORDS_PER_TILE;
     int chunk_z_dist = tile_h * Z_COORDS_PER_TILE;
 
-    int chunk_r = int(abs(map_pos.y - ws_pos.z) / chunk_z_dist);
-    int chunk_c = int(abs(map_pos.x - ws_pos.x) / chunk_x_dist);
+    int chunk_r = int(abs(map_pos.y - ws_pos.z) / float(chunk_z_dist));
+    int chunk_c = int(abs(map_pos.x - ws_pos.x) / float(chunk_x_dist));
 
-    float chunk_base_x = map_pos.x - (chunk_c * chunk_x_dist);
-    float chunk_base_z = map_pos.y + (chunk_r * chunk_z_dist);
+    float chunk_base_x = map_pos.x - float(chunk_c * chunk_x_dist);
+    float chunk_base_z = map_pos.y + float(chunk_r * chunk_z_dist);
 
-    float percentu = clamp((chunk_base_x - ws_pos.x) / chunk_x_dist, 0, 1.0);
-    float percentv = clamp((ws_pos.z - chunk_base_z) / chunk_z_dist, 0, 1.0);
+    float percentu = clamp((chunk_base_x - ws_pos.x) / float(chunk_x_dist), 0.0, 1.0);
+    float percentv = clamp((ws_pos.z - chunk_base_z) / float(chunk_z_dist), 0.0, 1.0);
 
     int res = int(sqrt(textureSize(height_map)));
     int buffx = int(percentu * (res - 1));
@@ -609,14 +609,14 @@ vec3 normal_at_pos(vec3 ws_pos)
     int chunk_x_dist = tile_w * X_COORDS_PER_TILE;
     int chunk_z_dist = tile_h * Z_COORDS_PER_TILE;
 
-    int chunk_r = int(abs(map_pos.y - ws_pos.z) / chunk_z_dist);
-    int chunk_c = int(abs(map_pos.x - ws_pos.x) / chunk_x_dist);
+    int chunk_r = int(abs(map_pos.y - ws_pos.z) / float(chunk_z_dist));
+    int chunk_c = int(abs(map_pos.x - ws_pos.x) / float(chunk_x_dist));
 
-    float chunk_base_x = map_pos.x - (chunk_c * chunk_x_dist);
-    float chunk_base_z = map_pos.y + (chunk_r * chunk_z_dist);
+    float chunk_base_x = map_pos.x - float(chunk_c * chunk_x_dist);
+    float chunk_base_z = map_pos.y + float(chunk_r * chunk_z_dist);
 
-    float percentu = clamp((chunk_base_x - ws_pos.x) / chunk_x_dist, 0, 1.0);
-    float percentv = clamp((ws_pos.z - chunk_base_z) / chunk_z_dist, 0, 1.0);
+    float percentu = clamp((chunk_base_x - ws_pos.x) / float(chunk_x_dist), 0.0, 1.0);
+    float percentv = clamp((ws_pos.z - chunk_base_z) / float(chunk_z_dist), 0.0, 1.0);
 
     int res = int(sqrt(textureSize(height_map)));
     int buffx = int(percentu * (res - 1));
@@ -921,7 +921,7 @@ void main()
 
     /* We increase the amount of ambient light that taller tiles get, in order to make
      * them not blend with lower terrain. */
-    float height = from_vertex.world_pos.y / Y_COORDS_PER_TILE;
+    float height = from_vertex.world_pos.y / float(Y_COORDS_PER_TILE);
 
     /* Ambient calculations */
     vec3 ambient = (TERRAIN_AMBIENT + height * EXTRA_AMBIENT_PER_LEVEL) * ambient_color;
