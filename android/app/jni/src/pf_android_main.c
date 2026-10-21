@@ -523,7 +523,7 @@ static bool extract_game_data(const char *basepath)
 /* ---------------------------------------------------------------------------
  * Entry point
  * ------------------------------------------------------------------------- */
-int main(int argc, char *argv[])
+int SDL_main(int argc, char *argv[])
 {
     (void)argc;
     (void)argv;
