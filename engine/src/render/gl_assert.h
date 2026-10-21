@@ -78,7 +78,11 @@
 
 #else
 
-#define PRINT(...) 
+#if defined(__ANDROID__)
+#define PRINT(_text) fprintf(stderr, "%s", (_text))
+#else
+#define PRINT(...)
+#endif
 #define GL_ASSERT_OK() /* no-op */
 
 #endif
