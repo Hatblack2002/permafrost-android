@@ -848,8 +848,17 @@ static void shader_install(const struct shader *shader)
     /* A shader can be unavailable on Android when its GLES compile/link
      * fails. Treat it as disabled rather than binding program 0 or issuing
      * uniform updates against a failed program. */
-    if(!shader || shader->prog_id <= 0)
+    if(!shader)
         return;
+
+    if(shader->prog_id <= 0) {
+        /* Do not accidentally draw with the previously installed program. */
+        if(s_curr_prog != 0) {
+            glUseProgram(0);
+            s_curr_prog = 0;
+        }
+        return;
+    }
 
     const struct uniform *curr = shader->uniforms;
 
