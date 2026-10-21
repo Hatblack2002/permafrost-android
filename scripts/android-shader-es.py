@@ -77,7 +77,7 @@ def insert_after_glsl_preamble(text: str, declaration: str) -> str:
     """
     lines = text.splitlines(keepends=True)
     version_idx = next(
-        (i for i, line in enumerate(lines) if re.match(r"\\s*#version\\b", line)),
+        (i for i, line in enumerate(lines) if re.match(r"\s*#version\b", line)),
         None,
     )
     if version_idx is None:
@@ -86,15 +86,19 @@ def insert_after_glsl_preamble(text: str, declaration: str) -> str:
     insert_idx = version_idx + 1
     while insert_idx < len(lines):
         stripped = lines[insert_idx].strip()
-        if not stripped or stripped.startswith("#extension") or re.match(r"precision\\s+\\w+\\s+\\w+\\s*;", stripped):
+        if (
+            not stripped
+            or stripped.startswith("#extension")
+            or re.match(r"precision\s+\w+\s+\w+\s*;", stripped)
+        ):
             insert_idx += 1
             continue
         break
 
     prefix = "".join(lines[:insert_idx])
-    if prefix and not prefix.endswith("\\n"):
-        prefix += "\\n"
-    return prefix + declaration.lstrip("\\n") + "\\n" + "".join(lines[insert_idx:])
+    if prefix and not prefix.endswith("\n"):
+        prefix += "\n"
+    return prefix + declaration.lstrip("\n") + "\n" + "".join(lines[insert_idx:])
 
 
 def transform(text: str, fname: str) -> str:
