@@ -53,6 +53,23 @@ VERT_CLIP_DECL = """
 out float pf_clip0;
 """
 
+# Vertex shaders that pass the clip value through the normals geometry shader.
+# The alias avoids an input/output name collision in GLSL.
+VERT_CLIP_PASS_THROUGH = {
+    "static.glsl",
+    "skinned.glsl",
+}
+
+GEOMETRY_CLIP_PASS = {
+    "normals.glsl",
+}
+
+# Vertex shaders without their own clip plane but paired with a clip-aware
+# fragment shader still need to emit a constant "inside" clip value.
+VERT_DEFAULT_CLIP = {
+    "basic.glsl",
+}
+
 FRAG_CLIP_DECL = """
 /* GLES port: water clip plane fed by the vertex stage. */
 in float pf_clip0;
@@ -67,6 +84,11 @@ def is_fragment(path: str) -> bool:
 def is_vertex(path: str) -> bool:
     norm = path.replace(os.sep, "/")
     return "/vertex/" in norm or norm.startswith("vertex/")
+
+
+def is_geometry(path: str) -> bool:
+    norm = path.replace(os.sep, "/")
+    return "/geometry/" in norm or norm.startswith("geometry/")
 
 
 def insert_after_glsl_preamble(text: str, declaration: str) -> str:
@@ -115,12 +137,23 @@ def transform(text: str, fname: str) -> str:
 
     # 3. clip distance emulation
     if is_vertex(fname) and "gl_ClipDistance" in text:
-        text = insert_after_glsl_preamble(text, VERT_CLIP_DECL)
+        declaration = VERT_CLIP_DECL
+        if os.path.basename(fname) in VERT_CLIP_PASS_THROUGH:
+            declaration += "\nout float pf_clip0_in;\n"
+        text = insert_after_glsl_preamble(text, declaration)
         text = re.sub(
             r"gl_ClipDistance\s*\[\s*0\s*\]\s*=",
             "pf_clip0 =",
             text,
         )
+        if os.path.basename(fname) in VERT_CLIP_PASS_THROUGH:
+            # The geometry stage consumes this alias and re-exports the
+            # original pf_clip0 name expected by colored.glsl.
+            text = re.sub(
+                r"(pf_clip0\s*=\s*[^;]+;)",
+                r"\1\n    pf_clip0_in = pf_clip0;",
+                text,
+            )
         # A hard stop in case some other clip-distance index shows up.
         leftover = re.findall(r"gl_ClipDistance\s*\[\s*(\d+)\s*\]", text)
         if leftover:
@@ -128,6 +161,24 @@ def transform(text: str, fname: str) -> str:
                 "error: unhandled gl_ClipDistance[%s] in %s"
                 % (",".join(leftover), fname)
             )
+
+    if is_vertex(fname) and os.path.basename(fname) in VERT_DEFAULT_CLIP:
+        text = insert_after_glsl_preamble(text, VERT_CLIP_DECL)
+        m = re.search(r"void\s+main\s*\(\s*\)\s*\{", text)
+        if not m:
+            sys.exit("error: no main() found in vertex shader %s" % fname)
+        text = text[: m.end()] + "\n    pf_clip0 = 1.0;" + text[m.end() :]
+
+    if is_geometry(fname) and os.path.basename(fname) in GEOMETRY_CLIP_PASS:
+        text = insert_after_glsl_preamble(
+            text, "in float pf_clip0_in[];\nout float pf_clip0;\n"
+        )
+        # Forward the input vertex's clip value for each emitted line endpoint.
+        text = re.sub(
+            r"EmitVertex\s*\(\s*\)\s*;",
+            "pf_clip0 = pf_clip0_in[i];\n        EmitVertex();",
+            text,
+        )
 
     if is_fragment(fname) and os.path.basename(fname) in CLIP_CONSUMER_FRAGS:
         text = insert_after_glsl_preamble(text, FRAG_CLIP_DECL)
