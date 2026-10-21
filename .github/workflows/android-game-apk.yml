@@ -186,24 +186,3 @@ jobs:
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "Link-level evidence only: on-device boot validation is a" >> "$GITHUB_STEP_SUMMARY"
           echo "separate acceptance gate (docs/PORT_STATUS.md)." >> "$GITHUB_STEP_SUMMARY"
-
-
-      - name: Upload game debug APK artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: pf-android-game-debug-apk
-          path: android/app/build/outputs/apk/debug/app-debug.apk
-          if-no-files-found: error
-
-      - name: Report milestone scope
-        run: |
-          echo "### Permafrost game APK (link milestone)" >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "Full engine (97 C sources incl. the Python 2.7 scripting" >> "$GITHUB_STEP_SUMMARY"
-          echo "subsystem) linked into libmain.so with CPython 2.7," >> "$GITHUB_STEP_SUMMARY"
-          echo "mimalloc and OpenAL Soft (OpenSL ES). Assets, scripts and" >> "$GITHUB_STEP_SUMMARY"
-          echo "GLES 3.2 shaders packaged into the APK; extracted to" >> "$GITHUB_STEP_SUMMARY"
-          echo "internal storage on first boot." >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "Link-level evidence only: on-device boot validation is a" >> "$GITHUB_STEP_SUMMARY"
-          echo "separate acceptance gate (docs/PORT_STATUS.md)." >> "$GITHUB_STEP_SUMMARY"
