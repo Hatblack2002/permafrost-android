@@ -166,7 +166,7 @@ def transform(text: str, fname: str) -> str:
         raise ValueError("%s has no supported GLSL version directive" % fname)
     version_line = version_match.group(0).strip()
     text = text[:version_match.start()] + text[version_match.end():]
-    text = version_line + "\\n" + text.lstrip("\\n")
+    text = version_line + "\n" + text.lstrip("\n")
 
     # 2. precisions for the fragment stage only (vertex/geometry/compute
     #    stages default to highp in GLSL ES).
