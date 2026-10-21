@@ -46,6 +46,14 @@ precision highp samplerBuffer;
 precision highp usamplerBuffer;
 """
 
+# GLSL ES does not provide default precision for opaque buffer samplers in
+# every shader stage/driver. Skinned vertex shaders use samplerBuffer directly.
+BUFFER_SAMPLER_PRECISION = """
+precision highp samplerBuffer;
+precision highp isamplerBuffer;
+precision highp usamplerBuffer;
+"""
+
 VERT_CLIP_DECL = """
 /* GLES port: the desktop clip-distance output is not available in
  * GLSL ES; the engine's water clip plane travels through this varying
@@ -156,6 +164,11 @@ def transform(text: str, fname: str) -> str:
         idx = text.index("#version 320 es")
         eol = text.index("\n", idx)
         text = text[: eol + 1] + FRAG_PRECISION + text[eol + 1 :]
+    else:
+        # Explicit samplerBuffer precision is needed by strict GLES compilers.
+        idx = text.index("#version 320 es")
+        eol = text.index("\n", idx)
+        text = text[: eol + 1] + BUFFER_SAMPLER_PRECISION + text[eol + 1 :]
 
     # 2b. Undefined macros in #if are errors on some GLES drivers, unlike desktop GLSL.
     text = define_undefined_if_identifiers(text)
