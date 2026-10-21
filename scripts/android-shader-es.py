@@ -123,6 +123,28 @@ def insert_after_glsl_preamble(text: str, declaration: str) -> str:
     return prefix + declaration.lstrip("\n") + "\n" + "".join(lines[insert_idx:])
 
 
+# Macros the engine injects after #version (engine/src/render/gl_shader.c).
+# Do not default these: the engine defines them for selected shader variants.
+ENGINE_INJECTED_DEFINES = {"TERRAIN_BAKED", "TERRAIN_BAKE_SRC"}
+
+
+def define_undefined_if_identifiers(text: str) -> str:
+    """Default undefined identifiers in #if/#elif to zero for strict GLES drivers."""
+    defined = set(re.findall(r"^\s*#\s*define\s+(\w+)", text, re.M))
+    missing = []
+    for match in re.finditer(r"^\s*#\s*(?:if|elif)\s+(.*)$", text, re.M):
+        expr = re.sub(r"/\*.*?\*/|//.*", "", match.group(1))
+        expr = re.sub(r"defined\s*\(?\s*\w+\s*\)?", "", expr)
+        for ident in re.findall(r"\b[A-Za-z_]\w*\b", expr):
+            if ident in defined or ident in ENGINE_INJECTED_DEFINES or ident in ("GL_ES", "__VERSION__") or ident in missing:
+                continue
+            missing.append(ident)
+    if not missing:
+        return text
+    decl = "".join("#define %s (0)\n" % ident for ident in missing)
+    return insert_after_glsl_preamble(text, decl)
+
+
 def transform(text: str, fname: str) -> str:
     # 1. version rewrite
     text = re.sub(r"#version\s+330\s+core", "#version 320 es", text)
@@ -134,6 +156,9 @@ def transform(text: str, fname: str) -> str:
         idx = text.index("#version 320 es")
         eol = text.index("\n", idx)
         text = text[: eol + 1] + FRAG_PRECISION + text[eol + 1 :]
+
+    # 2b. Undefined macros in #if are errors on some GLES drivers, unlike desktop GLSL.
+    text = define_undefined_if_identifiers(text)
 
     # 3. clip distance emulation
     if is_vertex(fname) and "gl_ClipDistance" in text:
