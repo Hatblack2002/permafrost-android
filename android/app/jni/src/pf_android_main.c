@@ -532,13 +532,15 @@ int main(int argc, char *argv[])
     pf_install_fatal_handlers();
     atexit(pf_atexit_report);
 
-    /* Pre-open the fatal-signal report file before anything can crash. */
+    /* Pre-open the fatal-signal report file before anything can crash.
+     * Append rather than truncate: a previous crash report must survive
+     * the next launch so it can be collected after the app closes. */
     {
         const char *ext = SDL_AndroidGetExternalStoragePath();
         if(ext && *ext) {
             char path[512];
             snprintf(path, sizeof(path), "%s/boot-report-fatal.txt", ext);
-            s_fatal_fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+            s_fatal_fd = open(path, O_WRONLY | O_CREAT | O_APPEND, 0644);
         }
     }
     pf_capture_stdio();
