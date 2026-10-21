@@ -42,4 +42,25 @@ fragment = MODULE.transform(source("fragment", "colored.glsl"), "fragment/colore
 check("in float pf_clip0;" in fragment, "colored fragment shader must consume clip value")
 check("if (pf_clip0 < 0.0) discard;" in fragment, "colored fragment shader must preserve clipping")
 
+for name in ("static.glsl", "static-shadowed.glsl"):
+    vertex = MODULE.transform(source("vertex", name), "vertex/" + name)
+    check("#define USE_GEOMETRY (0)" in vertex, name + " must define USE_GEOMETRY for GLES")
+    check(vertex.index("#define USE_GEOMETRY (0)") < vertex.index("#if USE_GEOMETRY"),
+          name + " must define USE_GEOMETRY before its first #if")
+
+for name in ("skinned.glsl", "skinned-shadowed.glsl"):
+    vertex = MODULE.transform(source("vertex", name), "vertex/" + name)
+    check(vertex.count("#define USE_GEOMETRY") == 1,
+          name + " already defines USE_GEOMETRY and must not get a duplicate definition")
+
+for name in ("terrain-shadowed.glsl", "terrain.glsl"):
+    for stage in ("fragment", "vertex"):
+        try:
+            shader = source(stage, name)
+        except FileNotFoundError:
+            continue
+        output = MODULE.transform(shader, stage + "/" + name)
+        check("#define TERRAIN_BAKED" not in output and "#define TERRAIN_BAKE_SRC" not in output,
+              stage + "/" + name + ": engine-injected TERRAIN_* macros must not be defaulted")
+
 print("GLES shader clip-varying regression checks passed.")
