@@ -84,14 +84,14 @@ int visbuff_idx(vec2 uv)
     int tile_h = map_resolution[3];
     int tiles_per_chunk = tile_w * tile_h;
 
-    int chunk_r = int(uv.y * chunk_h);
-    int chunk_c = int(uv.x * chunk_w);
+    int chunk_r = int(uv.y * float(chunk_h));
+    int chunk_c = int(uv.x * float(chunk_w));
 
-    float chunk_height = 1.0 / chunk_h;
-    float chunk_width = 1.0 / chunk_w;
+    float chunk_height = 1.0 / float(chunk_h);
+    float chunk_width = 1.0 / float(chunk_w);
 
-    int tile_r = int(mod(uv.y, chunk_height)/chunk_height * tile_h);
-    int tile_c = int(mod(uv.x, chunk_width)/chunk_width * tile_w);
+    int tile_r = int(mod(uv.y, chunk_height)/chunk_height * float(tile_h));
+    int tile_c = int(mod(uv.x, chunk_width)/chunk_width * float(tile_w));
 
     return visbuff_offset + (chunk_r * tiles_per_chunk * chunk_w) 
                           + (chunk_c * tiles_per_chunk) 

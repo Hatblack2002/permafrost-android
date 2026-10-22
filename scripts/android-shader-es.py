@@ -44,6 +44,17 @@ precision highp sampler2D;
 precision highp samplerCube;
 precision highp samplerBuffer;
 precision highp usamplerBuffer;
+precision highp sampler2DArray;
+precision highp sampler2DShadow;
+precision highp sampler2DArrayShadow;
+"""
+
+# GLSL ES does not provide default precision for opaque buffer samplers in
+# every shader stage/driver. Skinned vertex shaders use samplerBuffer directly.
+BUFFER_SAMPLER_PRECISION = """
+precision highp samplerBuffer;
+precision highp isamplerBuffer;
+precision highp usamplerBuffer;
 """
 
 VERT_CLIP_DECL = """
@@ -52,6 +63,23 @@ VERT_CLIP_DECL = """
  * instead (see scripts/android-shader-es.py). */
 out float pf_clip0;
 """
+
+# Vertex shaders that pass the clip value through the normals geometry shader.
+# The alias avoids an input/output name collision in GLSL.
+VERT_CLIP_PASS_THROUGH = {
+    "static.glsl",
+    "skinned.glsl",
+}
+
+GEOMETRY_CLIP_PASS = {
+    "normals.glsl",
+}
+
+# Vertex shaders without their own clip plane but paired with a clip-aware
+# fragment shader still need to emit a constant "inside" clip value.
+VERT_DEFAULT_CLIP = {
+    "basic.glsl",
+}
 
 FRAG_CLIP_DECL = """
 /* GLES port: water clip plane fed by the vertex stage. */
@@ -67,6 +95,11 @@ def is_fragment(path: str) -> bool:
 def is_vertex(path: str) -> bool:
     norm = path.replace(os.sep, "/")
     return "/vertex/" in norm or norm.startswith("vertex/")
+
+
+def is_geometry(path: str) -> bool:
+    norm = path.replace(os.sep, "/")
+    return "/geometry/" in norm or norm.startswith("geometry/")
 
 
 def insert_after_glsl_preamble(text: str, declaration: str) -> str:
@@ -101,10 +134,42 @@ def insert_after_glsl_preamble(text: str, declaration: str) -> str:
     return prefix + declaration.lstrip("\n") + "\n" + "".join(lines[insert_idx:])
 
 
+# Macros the engine injects after #version (engine/src/render/gl_shader.c).
+# Do not default these: the engine defines them for selected shader variants.
+ENGINE_INJECTED_DEFINES = {"TERRAIN_BAKED", "TERRAIN_BAKE_SRC"}
+
+
+def define_undefined_if_identifiers(text: str) -> str:
+    """Default undefined identifiers in #if/#elif to zero for strict GLES drivers."""
+    defined = set(re.findall(r"^\s*#\s*define\s+(\w+)", text, re.M))
+    missing = []
+    for match in re.finditer(r"^\s*#\s*(?:if|elif)\s+(.*)$", text, re.M):
+        expr = re.sub(r"/\*.*?\*/|//.*", "", match.group(1))
+        expr = re.sub(r"defined\s*\(?\s*\w+\s*\)?", "", expr)
+        for ident in re.findall(r"\b[A-Za-z_]\w*\b", expr):
+            if ident in defined or ident in ENGINE_INJECTED_DEFINES or ident in ("GL_ES", "__VERSION__") or ident in missing:
+                continue
+            missing.append(ident)
+    if not missing:
+        return text
+    decl = "".join("#define %s (0)\n" % ident for ident in missing)
+    return insert_after_glsl_preamble(text, decl)
+
+
 def transform(text: str, fname: str) -> str:
-    # 1. version rewrite
+    # 1. version rewrite. In GLSL ES, #version must precede comments and
+    #    every other token. Desktop engine shaders commonly put a comment
+    #    banner first, so move the version directive to the first line after
+    #    rewriting it; otherwise real GLES compilers reject the shader before
+    #    checking any of its code.
     text = re.sub(r"#version\s+330\s+core", "#version 320 es", text)
     text = re.sub(r"#version\s+430\s+core", "#version 320 es", text)
+    version_match = re.search(r"^\s*#version\s+320\s+es\s*$", text, re.M)
+    if not version_match:
+        raise ValueError("%s has no supported GLSL version directive" % fname)
+    version_line = version_match.group(0).strip()
+    text = text[:version_match.start()] + text[version_match.end():]
+    text = version_line + "\n" + text.lstrip("\n")
 
     # 2. precisions for the fragment stage only (vertex/geometry/compute
     #    stages default to highp in GLSL ES).
@@ -112,15 +177,34 @@ def transform(text: str, fname: str) -> str:
         idx = text.index("#version 320 es")
         eol = text.index("\n", idx)
         text = text[: eol + 1] + FRAG_PRECISION + text[eol + 1 :]
+    else:
+        # Explicit samplerBuffer precision is needed by strict GLES compilers.
+        idx = text.index("#version 320 es")
+        eol = text.index("\n", idx)
+        text = text[: eol + 1] + BUFFER_SAMPLER_PRECISION + text[eol + 1 :]
+
+    # 2b. Undefined macros in #if are errors on some GLES drivers, unlike desktop GLSL.
+    text = define_undefined_if_identifiers(text)
 
     # 3. clip distance emulation
     if is_vertex(fname) and "gl_ClipDistance" in text:
-        text = insert_after_glsl_preamble(text, VERT_CLIP_DECL)
+        declaration = VERT_CLIP_DECL
+        if os.path.basename(fname) in VERT_CLIP_PASS_THROUGH:
+            declaration += "\nout float pf_clip0_in;\n"
+        text = insert_after_glsl_preamble(text, declaration)
         text = re.sub(
             r"gl_ClipDistance\s*\[\s*0\s*\]\s*=",
             "pf_clip0 =",
             text,
         )
+        if os.path.basename(fname) in VERT_CLIP_PASS_THROUGH:
+            # The geometry stage consumes this alias and re-exports the
+            # original pf_clip0 name expected by colored.glsl.
+            text = re.sub(
+                r"(pf_clip0\s*=\s*[^;]+;)",
+                r"\1\n    pf_clip0_in = pf_clip0;",
+                text,
+            )
         # A hard stop in case some other clip-distance index shows up.
         leftover = re.findall(r"gl_ClipDistance\s*\[\s*(\d+)\s*\]", text)
         if leftover:
@@ -128,6 +212,24 @@ def transform(text: str, fname: str) -> str:
                 "error: unhandled gl_ClipDistance[%s] in %s"
                 % (",".join(leftover), fname)
             )
+
+    if is_vertex(fname) and os.path.basename(fname) in VERT_DEFAULT_CLIP:
+        text = insert_after_glsl_preamble(text, VERT_CLIP_DECL)
+        m = re.search(r"void\s+main\s*\(\s*\)\s*\{", text)
+        if not m:
+            sys.exit("error: no main() found in vertex shader %s" % fname)
+        text = text[: m.end()] + "\n    pf_clip0 = 1.0;" + text[m.end() :]
+
+    if is_geometry(fname) and os.path.basename(fname) in GEOMETRY_CLIP_PASS:
+        text = insert_after_glsl_preamble(
+            text, "in float pf_clip0_in[];\nout float pf_clip0;\n"
+        )
+        # Forward the input vertex's clip value for each emitted line endpoint.
+        text = re.sub(
+            r"EmitVertex\s*\(\s*\)\s*;",
+            "pf_clip0 = pf_clip0_in[i];\n        EmitVertex();",
+            text,
+        )
 
     if is_fragment(fname) and os.path.basename(fname) in CLIP_CONSUMER_FRAGS:
         text = insert_after_glsl_preamble(text, FRAG_CLIP_DECL)

@@ -38,7 +38,7 @@
 #define MAX_MATERIALS 16
 
 #define SPECULAR_STRENGTH  0.5
-#define SPECULAR_SHININESS 2
+#define SPECULAR_SHININESS 2.0
 
 #define SHADOW_MAP_BIAS 0.002
 #define SHADOW_MULTIPLIER 0.55
@@ -112,9 +112,9 @@ vec4 sample_material(int mat_idx, vec2 uv)
 float shadow_factor(vec4 light_space_pos)
 {
     vec3 proj_coords = (light_space_pos.xyz / light_space_pos.w) * 0.5 + 0.5;
-    if(proj_coords.x < 0 || proj_coords.x >= textureSize(shadow_map, 0).x)
+    if(proj_coords.x < 0.0 || proj_coords.x >= float(textureSize(shadow_map, 0).x))
         return 0.0;
-    if(proj_coords.y < 0 || proj_coords.y >= textureSize(shadow_map, 0).y)
+    if(proj_coords.y < 0.0 || proj_coords.y >= float(textureSize(shadow_map, 0).y))
         return 0.0;
     if(proj_coords.z > 0.95)
         return 0.0;

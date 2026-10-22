@@ -52,8 +52,8 @@
  * and division and square root are the correctly rounded div_rn and sqrt_rn.
  */
 
-#define LANES               (64)
-layout(local_size_x = LANES) in;
+#define LANES 64u
+layout(local_size_x = 64) in;
 
 #define EPSILON             (1.0 / 1024.0)
 #define MAX_PAIRWISE_RAYS   (24)
@@ -373,16 +373,16 @@ void build_vos()
 {
     if(s_lane == 0u) {
         uint n = 0u;
-        for(uint k = 0; k < sh_ndyn; k++) {
+        for(uint k = 0u; k < sh_ndyn; k++) {
             if(!same_position(s_pos, nb_pos(sh_dyn[k])))
                 sh_src[n++] = sh_dyn[k];
         }
-        for(uint k = 0; k < sh_nstat; k++) {
+        for(uint k = 0u; k < sh_nstat; k++) {
             if(!same_position(s_pos, nb_pos(sh_stat[k]))
             && stat_radius_sum(sh_stat[k]) > 0.0)
                 sh_src[n++] = sh_stat[k] | SRC_STAT;
         }
-        for(uint k = 0; k < sh_ntiles; k++) {
+        for(uint k = 0u; k < sh_ntiles; k++) {
             if(!same_position(s_pos, nb_pos(sh_tile[k])))
                 sh_src[n++] = sh_tile[k] | SRC_TILE;
         }
@@ -406,7 +406,7 @@ void build_vos()
 bool inside_pcr(vec2 test)
 {
     const float eps2 = float(EPSILON * EPSILON);
-    for(uint i = 0; i < sh_nvos; i++) {
+    for(uint i = 0u; i < sh_nvos; i++) {
 
         precise vec2 d = test - sh_apex[i];
         precise float l2 = d.x * d.x + d.y * d.y;
@@ -577,7 +577,7 @@ bool solve_once(vec2 des_v, out vec2 vnew)
         float d = uintBitsToFloat(0x7F800000u);
         uint bc = NO_CANDIDATE;
         vec2 bv = vec2(0.0);
-        for(uint l = 0; l < LANES; l++) {
+        for(uint l = 0u; l < LANES; l++) {
             if(sh_best_d[l] < d || (sh_best_d[l] == d && sh_best_c[l] < bc)) {
                 d = sh_best_d[l];
                 bc = sh_best_c[l];
@@ -599,17 +599,17 @@ void remove_furthest()
     int cls = -1;
     uint idx = 0u;
 
-    for(uint k = 0; k < sh_ndyn; k++) {
+    for(uint k = 0u; k < sh_ndyn; k++) {
         precise vec2 d = s_pos - nb_pos(sh_dyn[k]);
         precise float d2 = len2(d);
         if(d2 > max_dist2) { max_dist2 = d2; cls = 0; idx = k; }
     }
-    for(uint k = 0; k < sh_nstat; k++) {
+    for(uint k = 0u; k < sh_nstat; k++) {
         precise vec2 d = s_pos - nb_pos(sh_stat[k]);
         precise float d2 = len2(d);
         if(d2 > max_dist2) { max_dist2 = d2; cls = 1; idx = k; }
     }
-    for(uint k = 0; k < sh_ntiles; k++) {
+    for(uint k = 0u; k < sh_ntiles; k++) {
         precise vec2 d = s_pos - nb_pos(sh_tile[k]);
         precise float d2 = len2(d);
         if(d2 > max_dist2) { max_dist2 = d2; cls = 2; idx = k; }
@@ -636,11 +636,11 @@ void main()
         sh_ndyn = s_unit.ndyn;
         sh_nstat = s_unit.nstat;
         sh_ntiles = s_unit.ntiles;
-        for(uint k = 0; k < sh_ndyn; k++)
+        for(uint k = 0u; k < sh_ndyn; k++)
             sh_dyn[k] = s_unit.first + k;
-        for(uint k = 0; k < sh_nstat; k++)
+        for(uint k = 0u; k < sh_nstat; k++)
             sh_stat[k] = s_unit.first + s_unit.ndyn + k;
-        for(uint k = 0; k < sh_ntiles; k++)
+        for(uint k = 0u; k < sh_ntiles; k++)
             sh_tile[k] = s_unit.first + s_unit.ndyn + s_unit.nstat + k;
         sh_miss = false;
     }

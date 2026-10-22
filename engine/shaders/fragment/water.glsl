@@ -114,14 +114,14 @@ ivec4 tile_desc_at(vec3 ws_pos)
     int chunk_x_dist = tile_w * X_COORDS_PER_TILE;
     int chunk_z_dist = tile_h * Z_COORDS_PER_TILE;
 
-    int chunk_r = int(abs(map_pos.y - ws_pos.z) / chunk_z_dist);
-    int chunk_c = int(abs(map_pos.x - ws_pos.x) / chunk_x_dist);
+    int chunk_r = int(abs(map_pos.y - ws_pos.z) / float(chunk_z_dist));
+    int chunk_c = int(abs(map_pos.x - ws_pos.x) / float(chunk_x_dist));
 
-    int chunk_base_x = int(map_pos.x - (chunk_c * chunk_x_dist));
-    int chunk_base_z = int(map_pos.y + (chunk_r * chunk_z_dist));
+    int chunk_base_x = int(map_pos.x - float(chunk_c * chunk_x_dist));
+    int chunk_base_z = int(map_pos.y + float(chunk_r * chunk_z_dist));
 
-    int tile_c = int(abs(chunk_base_x - ws_pos.x) / X_COORDS_PER_TILE);
-    int tile_r = int(abs(chunk_base_z - ws_pos.z) / Z_COORDS_PER_TILE);
+    int tile_c = int(abs(float(chunk_base_x) - ws_pos.x) / float(X_COORDS_PER_TILE));
+    int tile_r = int(abs(float(chunk_base_z) - ws_pos.z) / float(Z_COORDS_PER_TILE));
 
     return ivec4(chunk_r, chunk_c, tile_r, tile_c);
 }
@@ -143,8 +143,8 @@ ivec4 tile_relative_desc(ivec4 desc, int dr, int dc)
     ret.x = clamp(ret.x, 0, map_resolution.x-1);
     ret.y = clamp(ret.y, 0, map_resolution.y-1);
 
-    ret.z = int(mod(ret.z + dr, map_resolution.z));
-    ret.a = int(mod(ret.a + dc, map_resolution.a));
+    ret.z = ((ret.z + dr) % map_resolution.z + map_resolution.z) % map_resolution.z;
+    ret.a = ((ret.a + dc) % map_resolution.a + map_resolution.a) % map_resolution.a;
 
     return ret;
 }
@@ -182,10 +182,10 @@ float bilinear_interp_unit_square(float tl, float tr, float bl, float br, vec2 c
 
 vec2 local_uv(vec2 global_uv)
 {
-    float x_per_chunk = 1.0 / map_resolution.x;
-    float z_per_chunk = 1.0 / map_resolution.y;
-    float x_per_tile = x_per_chunk / map_resolution.z;
-    float z_per_tile = z_per_chunk / map_resolution.a;
+    float x_per_chunk = 1.0 / float(map_resolution.x);
+    float z_per_chunk = 1.0 / float(map_resolution.y);
+    float x_per_tile = x_per_chunk / float(map_resolution.z);
+    float z_per_tile = z_per_chunk / float(map_resolution.a);
 
     /* convert to range [0, 1] for the entire map */
     global_uv /= -water_tiling;

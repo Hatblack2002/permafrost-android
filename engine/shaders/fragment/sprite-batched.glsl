@@ -75,10 +75,10 @@ vec4 sprite_texture(uint frame_idx, vec2 uv)
     int v_offset = row * row_height;
 
     /* Normalize the new coordinate to the [0, 1] range */
-    float u_coord = u_offset + (uv.x * col_width);
-    float v_coord = v_offset + (uv.y * row_height);
-    return texture(sprite_sheet, vec2(u_coord / textureSize(sprite_sheet, 0).x,
-                                      v_coord / textureSize(sprite_sheet, 0).y));
+    float u_coord = float(u_offset) + (uv.x * float(col_width));
+    float v_coord = float(v_offset) + (uv.y * float(row_height));
+    return texture(sprite_sheet, vec2(u_coord / float(textureSize(sprite_sheet, 0).x),
+                                      v_coord / float(textureSize(sprite_sheet, 0).y)));
 }
 
 void main()

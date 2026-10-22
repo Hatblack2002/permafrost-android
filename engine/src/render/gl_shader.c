@@ -809,6 +809,8 @@ static bool shader_make_prog(const GLuint vertex_shader, const GLuint geo_shader
         glGetProgramInfoLog(*out, sizeof(info), NULL, info);
         pf_strlcat(info, "\n", sizeof(info));
         PRINT(info);
+        glDeleteProgram(*out);
+        *out = 0;
         return false;
     }
 
@@ -843,6 +845,21 @@ static const struct shader *shader_for_prog(GLuint prog)
 
 static void shader_install(const struct shader *shader)
 {
+    /* A shader can be unavailable on Android when its GLES compile/link
+     * fails. Treat it as disabled rather than binding program 0 or issuing
+     * uniform updates against a failed program. */
+    if(!shader)
+        return;
+
+    if(shader->prog_id <= 0) {
+        /* Do not accidentally draw with the previously installed program. */
+        if(s_curr_prog != 0) {
+            glUseProgram(0);
+            s_curr_prog = 0;
+        }
+        return;
+    }
+
     const struct uniform *curr = shader->uniforms;
 
     if(s_curr_prog != shader->prog_id) {
@@ -869,13 +886,15 @@ bool R_GL_Shader_InitAll(const char *base_path)
 
         char path[512];
         struct shader *res = &s_shaders[i];
+        /* Zero means this program is unavailable on this device. */
+        res->prog_id = 0;
         GLuint vertex = 0, geometry = 0, fragment = 0, compute = 0;
 
         if(res->vertex_path) {
             pf_snprintf(path, sizeof(path), "%s/%s", base_path, res->vertex_path);
             if(!shader_load_and_init(path, NULL, &vertex, GL_VERTEX_SHADER)) {
                 PRINT("Failed to load and init vertex shader.\n");
-                goto fail;
+                goto shader_failed;
             }
         }
         assert(!res->vertex_path || vertex > 0);
@@ -884,7 +903,7 @@ bool R_GL_Shader_InitAll(const char *base_path)
             pf_snprintf(path, sizeof(path), "%s/%s", base_path, res->geo_path);
             if(!shader_load_and_init(path, NULL, &geometry, GL_GEOMETRY_SHADER)) {
                 PRINT("Failed to load and init geometry shader.\n");
-                goto fail;
+                goto shader_failed;
             }
         }
         assert(!res->geo_path || geometry > 0);
@@ -893,7 +912,7 @@ bool R_GL_Shader_InitAll(const char *base_path)
             pf_snprintf(path, sizeof(path), "%s/%s", base_path, res->frag_path);
             if(!shader_load_and_init(path, res->frag_defines, &fragment, GL_FRAGMENT_SHADER)) {
                 PRINT("Failed to load and init fragment shader.\n");
-                goto fail;
+                goto shader_failed;
             }
         }
         assert(!res->frag_path || fragment > 0);
@@ -911,7 +930,7 @@ bool R_GL_Shader_InitAll(const char *base_path)
             pf_snprintf(path, sizeof(path), "%s/%s", base_path, res->compute_path);
             if(!shader_load_and_init(path, NULL, &compute, GL_COMPUTE_SHADER)) {
                 PRINT("Failed to load and init compute shader.\n");
-                goto fail;
+                goto shader_failed;
             }
         }
         assert(!res->compute_path || compute > 0);
@@ -921,7 +940,7 @@ bool R_GL_Shader_InitAll(const char *base_path)
             pf_snprintf(buff, sizeof(buff), "Failed to make shader program %d of %d.\n",
                 i + 1, (int)ARR_SIZE(s_shaders));
             PRINT(buff);
-            goto fail;
+            goto shader_failed;
         }
 
         if(vertex)      glDeleteShader(vertex);
@@ -930,12 +949,30 @@ bool R_GL_Shader_InitAll(const char *base_path)
         if(compute)     glDeleteShader(compute);
         continue;
 
-    fail:
+    shader_failed:
         if(vertex)      glDeleteShader(vertex);
         if(geometry)    glDeleteShader(geometry);
         if(fragment)    glDeleteShader(fragment);
         if(compute)     glDeleteShader(compute);
+        res->prog_id = 0;
+#ifdef __ANDROID__
+        /*
+         * Android GLES drivers vary in shader support. A broken optional
+         * program must not prevent the rest of the renderer from starting.
+         * Keep the failure in the log and disable only this program; callers
+         * of R_GL_Shader_Install will safely ignore unavailable programs.
+         */
+        {
+            char buff[512];
+            pf_snprintf(buff, sizeof(buff),
+                "Android GLES: skipping unavailable shader program '%s'; continuing startup.\\n",
+                res->name);
+            PRINT(buff);
+        }
+        continue;
+#else
         return false;
+#endif
     }
 
     return true;
@@ -950,7 +987,7 @@ GLint R_GL_Shader_GetProgForName(const char *name)
         const struct shader *curr = &s_shaders[i];
 
         if(!strcmp(curr->name, name))
-            return curr->prog_id;
+            return curr->prog_id > 0 ? curr->prog_id : 0;
     }
     
     return -1;

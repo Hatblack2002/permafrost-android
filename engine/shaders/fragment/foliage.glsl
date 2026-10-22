@@ -123,14 +123,14 @@ ivec4 tile_desc_at(vec3 ws_pos)
     int chunk_x_dist = tile_w * X_COORDS_PER_TILE;
     int chunk_z_dist = tile_h * Z_COORDS_PER_TILE;
 
-    int chunk_r = int(abs(map_pos.y - ws_pos.z) / chunk_z_dist);
-    int chunk_c = int(abs(map_pos.x - ws_pos.x) / chunk_x_dist);
+    int chunk_r = int(abs(map_pos.y - ws_pos.z) / float(chunk_z_dist));
+    int chunk_c = int(abs(map_pos.x - ws_pos.x) / float(chunk_x_dist));
 
-    int chunk_base_x = int(map_pos.x - (chunk_c * chunk_x_dist));
-    int chunk_base_z = int(map_pos.y + (chunk_r * chunk_z_dist));
+    int chunk_base_x = int(map_pos.x - float(chunk_c * chunk_x_dist));
+    int chunk_base_z = int(map_pos.y + float(chunk_r * chunk_z_dist));
 
-    int tile_c = int(abs(chunk_base_x - ws_pos.x) / X_COORDS_PER_TILE);
-    int tile_r = int(abs(chunk_base_z - ws_pos.z) / Z_COORDS_PER_TILE);
+    int tile_c = int(abs(float(chunk_base_x) - ws_pos.x) / float(X_COORDS_PER_TILE));
+    int tile_r = int(abs(float(chunk_base_z) - ws_pos.z) / float(Z_COORDS_PER_TILE));
 
     return ivec4(chunk_r, chunk_c, tile_r, tile_c);
 }
@@ -173,8 +173,8 @@ ivec4 tile_relative_desc(ivec4 desc, int dr, int dc)
     return ivec4(
         abs_r / map_resolution.z,
         abs_c / map_resolution.a,
-        int(mod(abs_r, map_resolution.z)),
-        int(mod(abs_c, map_resolution.a))
+        abs_r % map_resolution.z,
+        abs_c % map_resolution.a
     );
 }
 
@@ -199,11 +199,11 @@ vec2 tile_local_uv(vec3 ws_pos)
     int chunk_x_dist = tile_w * X_COORDS_PER_TILE;
     int chunk_z_dist = tile_h * Z_COORDS_PER_TILE;
 
-    int chunk_r = int(abs(map_pos.y - ws_pos.z) / chunk_z_dist);
-    int chunk_c = int(abs(map_pos.x - ws_pos.x) / chunk_x_dist);
+    int chunk_r = int(abs(map_pos.y - ws_pos.z) / float(chunk_z_dist));
+    int chunk_c = int(abs(map_pos.x - ws_pos.x) / float(chunk_x_dist));
 
-    float chunk_base_x = map_pos.x - (chunk_c * chunk_x_dist);
-    float chunk_base_z = map_pos.y + (chunk_r * chunk_z_dist);
+    float chunk_base_x = map_pos.x - float(chunk_c * chunk_x_dist);
+    float chunk_base_z = map_pos.y + float(chunk_r * chunk_z_dist);
 
     float u = mod(abs(chunk_base_x - ws_pos.x), float(X_COORDS_PER_TILE)) / float(X_COORDS_PER_TILE);
     float v = mod(abs(chunk_base_z - ws_pos.z), float(Z_COORDS_PER_TILE)) / float(Z_COORDS_PER_TILE);

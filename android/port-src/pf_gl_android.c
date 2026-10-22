@@ -17,6 +17,22 @@
 #include <EGL/egl.h>
 #include <stdbool.h>
 #include <string.h>
+#include <android/log.h>
+
+/* Directive A: one-line NULL guard log, so the next logcat names the
+ * exact runtime-resolved entry point that came back NULL. Defined
+ * before its first use (glBufferStorage below). */
+#define PF_GL_NULL_GUARD(real, fname)                                       \
+    do {                                                                    \
+        if(!(real)) {                                                       \
+            static int warned;                                              \
+            if(!warned) {                                                   \
+                warned = 1;                                                 \
+                __android_log_print(ANDROID_LOG_ERROR, "pf-gl",             \
+                                    "PF/GL NULL fn: " fname);               \
+            }                                                               \
+        }                                                                   \
+    } while(0)
 
 static PFNGLBUFFERSTORAGEEXTPROC s_pf_gl_buffer_storage;
 static int s_pf_gl_buffer_storage_resolved;
@@ -34,6 +50,7 @@ void glBufferStorage(GLenum target, GLsizeiptr size, const void *data,
         s_pf_gl_buffer_storage_resolved = 1;
     }
 
+    PF_GL_NULL_GUARD(s_pf_gl_buffer_storage, "glBufferStorage");
     if(s_pf_gl_buffer_storage)
         s_pf_gl_buffer_storage(target, size, data, flags);
 }
@@ -165,6 +182,7 @@ void glTexImage2D(GLenum target, GLint level, GLint internalformat,
     static pf_teximg2d_t real;
     if(!real)
         real = (pf_teximg2d_t)pf_gl_resolve_core("glTexImage2D");
+    PF_GL_NULL_GUARD(real, "glTexImage2D");
     if(real)
         real(target, level, internalformat, width, height, border,
              format, type, pixels);
@@ -191,6 +209,7 @@ void glTexImage3D(GLenum target, GLint level, GLint internalformat,
     static pf_gl_teximg3d_t real;
     if(!real)
         real = (pf_gl_teximg3d_t)pf_gl_resolve_core("glTexImage3D");
+    PF_GL_NULL_GUARD(real, "glTexImage3D");
     if(real)
         real(target, level, internalformat, width, height, depth,
              border, format, type, pixels);
@@ -256,6 +275,7 @@ void *glMapBuffer(GLenum target, GLenum access)
     static pf_mapbuffer_t real;
     if(!real)
         real = (pf_mapbuffer_t)pf_gl_resolve_core("glMapBuffer");
+    PF_GL_NULL_GUARD(real, "glMapBuffer");
     if(real)
         return real(target, access);
 
@@ -277,6 +297,7 @@ void glQueryCounter(GLuint id, GLenum target)
     static pf_querycounter_t real;
     if(!real)
         real = (pf_querycounter_t)pf_gl_resolve_core("glQueryCounter");
+    PF_GL_NULL_GUARD(real, "glQueryCounter");
     if(real)
         real(id, target);
 }
@@ -288,6 +309,7 @@ void glGetQueryObjectiv(GLuint id, GLenum pname, GLint *params)
     static pf_getqoiv_t real;
     if(!real)
         real = (pf_getqoiv_t)pf_gl_resolve_core("glGetQueryObjectiv");
+    PF_GL_NULL_GUARD(real, "glGetQueryObjectiv");
     if(real)
         real(id, pname, params);
 }
@@ -304,6 +326,7 @@ void glMultiDrawArraysIndirect(GLenum mode, const void *indirect,
         if(!real)
             real = (pf_mdi_t)eglGetProcAddress("glMultiDrawArraysIndirectEXT");
     }
+    PF_GL_NULL_GUARD(real, "glMultiDrawArraysIndirect");
     if(real)
         real(mode, indirect, count, stride);
 }
@@ -409,6 +432,105 @@ void glGetTextureSubImage(GLuint texture, GLint level, GLint xoffset,
     glBindFramebuffer(GL_DRAW_FRAMEBUFFER, (GLuint)prev_draw_fbo);
     glBindFramebuffer(GL_READ_FRAMEBUFFER, (GLuint)prev_read_fbo);
     glDeleteFramebuffers(1, &fbo);
+}
+
+/* ---- GLES incompatibility guards (directive B1) ---------------------
+ * GL_TEXTURE_LOD_BIAS (0x8501) is a desktop-GL token with no GLES 3.x
+ * core equivalent (pf_gl.h keeps it defined so the texture-state code
+ * compiles; the driver reports GL_INVALID_ENUM, "pname 34049").
+ *
+ * These wrappers shadow the GLESv3 exports for every TU linked into
+ * libmain.so (same mechanism as the glTexImage2D shim above). If the
+ * driver exposes GL_EXT_texture_lod_bias, forward unchanged —
+ * GL_TEXTURE_LOD_BIAS_EXT is the same numeric token. Otherwise drop
+ * the call: the LOD bias effect is imperceptible here. */
+static bool pf_gl_has_lod_bias_ext(void)
+{
+    static int cached = -1;
+    if(cached < 0) {
+        const unsigned char *exts = glGetString(GL_EXTENSIONS);
+        cached = (exts && pf_gl_has_extension(exts,
+            "GL_EXT_texture_lod_bias")) ? 1 : 0;
+    }
+    return cached != 0;
+}
+
+static void pf_gl_log_lod_bias_dropped(void)
+{
+    static int logged;
+    if(!logged) {
+        logged = 1;
+        __android_log_print(ANDROID_LOG_WARN, "pf-gl",
+            "PF/GL: GL_TEXTURE_LOD_BIAS no soportado, omitido");
+    }
+}
+
+void glTexParameterf(GLenum target, GLenum pname, GLfloat param);
+void glTexParameterf(GLenum target, GLenum pname, GLfloat param)
+{
+    typedef void (*pf_txf_t)(GLenum, GLenum, GLfloat);
+    static pf_txf_t real;
+    if(!real)
+        real = (pf_txf_t)pf_gl_resolve_core("glTexParameterf");
+    if(pname == GL_TEXTURE_LOD_BIAS && !pf_gl_has_lod_bias_ext()) {
+        PF_GL_NULL_GUARD(real, "glTexParameterf");
+        pf_gl_log_lod_bias_dropped();
+        return;
+    }
+    PF_GL_NULL_GUARD(real, "glTexParameterf");
+    if(real)
+        real(target, pname, param);
+}
+
+void glTexParameteri(GLenum target, GLenum pname, GLint param);
+void glTexParameteri(GLenum target, GLenum pname, GLint param)
+{
+    typedef void (*pf_txi_t)(GLenum, GLenum, GLint);
+    static pf_txi_t real;
+    if(!real)
+        real = (pf_txi_t)pf_gl_resolve_core("glTexParameteri");
+    if(pname == GL_TEXTURE_LOD_BIAS && !pf_gl_has_lod_bias_ext()) {
+        PF_GL_NULL_GUARD(real, "glTexParameteri");
+        pf_gl_log_lod_bias_dropped();
+        return;
+    }
+    PF_GL_NULL_GUARD(real, "glTexParameteri");
+    if(real)
+        real(target, pname, param);
+}
+
+void glTexParameterfv(GLenum target, GLenum pname, const GLfloat *params);
+void glTexParameterfv(GLenum target, GLenum pname, const GLfloat *params)
+{
+    typedef void (*pf_txfv_t)(GLenum, GLenum, const GLfloat *);
+    static pf_txfv_t real;
+    if(!real)
+        real = (pf_txfv_t)pf_gl_resolve_core("glTexParameterfv");
+    if(pname == GL_TEXTURE_LOD_BIAS && !pf_gl_has_lod_bias_ext()) {
+        PF_GL_NULL_GUARD(real, "glTexParameterfv");
+        pf_gl_log_lod_bias_dropped();
+        return;
+    }
+    PF_GL_NULL_GUARD(real, "glTexParameterfv");
+    if(real)
+        real(target, pname, params);
+}
+
+void glTexParameteriv(GLenum target, GLenum pname, const GLint *params);
+void glTexParameteriv(GLenum target, GLenum pname, const GLint *params)
+{
+    typedef void (*pf_txiv_t)(GLenum, GLenum, const GLint *);
+    static pf_txiv_t real;
+    if(!real)
+        real = (pf_txiv_t)pf_gl_resolve_core("glTexParameteriv");
+    if(pname == GL_TEXTURE_LOD_BIAS && !pf_gl_has_lod_bias_ext()) {
+        PF_GL_NULL_GUARD(real, "glTexParameteriv");
+        pf_gl_log_lod_bias_dropped();
+        return;
+    }
+    PF_GL_NULL_GUARD(real, "glTexParameteriv");
+    if(real)
+        real(target, pname, params);
 }
 
 /* ---- bionic compatibility ------------------------------------------ */

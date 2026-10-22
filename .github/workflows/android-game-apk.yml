@@ -14,6 +14,13 @@ name: Android game APK
 
 on:
   workflow_dispatch:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    paths:
+      - "android/**"
+      - "engine/**"
+      - "scripts/**"
+      - ".github/workflows/android-game-apk.yml"
   push:
     paths:
       - "android/**"
@@ -90,6 +97,9 @@ jobs:
           test -f android/app/jni/prebuilt/openal/libopenal.a
           cat android/app/jni/prebuilt/BUILD_INFO.txt
 
+      - name: Test GLES shader clip-varying transformation
+        run: python3 scripts/test-android-shader-es.py
+
       # Shaders are transformed from desktop GLSL (330/430 core) to GLES
       # 3.2 at packaging time; the engine sources stay pristine.
       - name: Transform shaders to GLES 3.2
@@ -97,6 +107,44 @@ jobs:
           mkdir -p android/app/src/main/assets/pf/shaders
           python3 scripts/android-shader-es.py \
             engine/shaders android/app/src/main/assets/pf/shaders
+
+      # Do not ship a build if any packaged shader fails a real GLSL ES
+      # compile. The device driver remains the final runtime check, but this
+      # catches type errors (int/float, mod, clamp, etc.) before APK install.
+      - name: Validate every packaged GLES shader
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y glslang-tools
+          count=0
+          failures=0
+          failure_log="$RUNNER_TEMP/gles-shader-failures.txt"
+          : > "$failure_log"
+          while IFS= read -r -d '' shader; do
+            case "$shader" in
+              */vertex/*) stage=vert ;;
+              */fragment/*) stage=frag ;;
+              */geometry/*) stage=geom ;;
+              */compute/*) stage=comp ;;
+              *) continue ;;
+            esac
+            echo "Validating $shader"
+            if glslangValidator -S "$stage" "$shader"; then
+              count=$((count + 1))
+            else
+              failures=$((failures + 1))
+              {
+                echo "===== $shader ($stage) ====="
+                glslangValidator -S "$stage" "$shader" || true
+                echo
+              } | tee -a "$failure_log"
+            fi
+          done < <(find android/app/src/main/assets/pf/shaders -name '*.glsl' -print0)
+          echo "Successfully validated $count GLES shader files."
+          if [ "$failures" -ne 0 ]; then
+            echo "::error::$failures GLES shader(s) failed validation; see diagnostics above."
+            exit 1
+          fi
 
       # The embedded interpreter resolves PYTHONHOME=<basepath>/scripts
       # and therefore looks for its stdlib under scripts/lib/python2.7.

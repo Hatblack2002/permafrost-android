@@ -92,6 +92,67 @@ static GLuint        s_null_tex;
 /* STATIC FUNCTIONS                                                          */
 /*****************************************************************************/
 
+#ifdef __ANDROID__
+/* Directive B2: GLES-safe glGenerateMipmap.
+ *  - Skip when the texture is attached to the currently bound FBO
+ *    (render targets don't need a mip chain here).
+ *  - Skip when level 0 has no internal format (texture never allocated
+ *    — exactly the driver's "unable to generate levels" case) or when
+ *    the format is not universally mipmap-compatible on GLES 3.2. Only
+ *    the RGBA8/RGB8 base formats are; the unsized GL_RGBA/GL_RGB forms
+ *    are the same storage and are treated as such. */
+static void pf_safe_generate_mipmap(GLenum target)
+{
+    GLenum tex_binding = (target == GL_TEXTURE_2D)
+        ? GL_TEXTURE_BINDING_2D : GL_TEXTURE_BINDING_2D_ARRAY;
+
+    GLint fbo = 0, tex = 0;
+    glGetIntegerv(GL_FRAMEBUFFER_BINDING, &fbo);
+    glGetIntegerv(tex_binding, &tex);
+
+    if(fbo && tex) {
+        static const GLenum attach_points[] = {
+            GL_COLOR_ATTACHMENT0, GL_COLOR_ATTACHMENT1,
+            GL_COLOR_ATTACHMENT2, GL_COLOR_ATTACHMENT3,
+            GL_DEPTH_ATTACHMENT, GL_STENCIL_ATTACHMENT,
+            GL_DEPTH_STENCIL_ATTACHMENT
+        };
+        for(size_t i = 0; i < ARR_SIZE(attach_points); i++) {
+            GLint type = 0, name = 0;
+            glGetFramebufferAttachmentParameteriv(GL_FRAMEBUFFER,
+                attach_points[i], GL_FRAMEBUFFER_ATTACHMENT_OBJECT_TYPE,
+                &type);
+            if(type != GL_TEXTURE)
+                continue;
+            glGetFramebufferAttachmentParameteriv(GL_FRAMEBUFFER,
+                attach_points[i], GL_FRAMEBUFFER_ATTACHMENT_OBJECT_NAME,
+                &name);
+            if(name && (GLuint)name == (GLuint)tex) {
+                printf("PF/GL: mipmap omitido en textura %u (unida a FBO)\n",
+                    (unsigned)tex);
+                return;
+            }
+        }
+    }
+
+    GLint ifmt = 0;
+    glGetTexLevelParameteriv(target, 0, GL_TEXTURE_INTERNAL_FORMAT, &ifmt);
+    if(ifmt != GL_RGBA8 && ifmt != GL_RGB8
+    && ifmt != GL_RGBA && ifmt != GL_RGB) {
+        printf("PF/GL: mipmap omitido en textura %u (formato no compatible: %d)\n",
+            (unsigned)tex, (int)ifmt);
+        return;
+    }
+
+    glGenerateMipmap(target);
+}
+#else /* desktop: unchanged behavior */
+static void pf_safe_generate_mipmap(GLenum target)
+{
+    glGenerateMipmap(target);
+}
+#endif
+
 static bool texture_gl_init(const char *path, GLuint *out)
 {
     ASSERT_IN_RENDER_THREAD();
@@ -113,7 +174,7 @@ static bool texture_gl_init(const char *path, GLuint *out)
 
     GLint format = (nr_channels == 3) ? GL_RGB : GL_RGBA;
     glTexImage2D(GL_TEXTURE_2D, 0, format, width, height, 0, format, GL_UNSIGNED_BYTE, data);
-    glGenerateMipmap(GL_TEXTURE_2D);
+    pf_safe_generate_mipmap(GL_TEXTURE_2D);
 
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
@@ -143,7 +204,7 @@ static void texture_make_null(GLuint *out)
 
     unsigned char data[] = {0, 0, 0};
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, 1, 1, 0, GL_RGB, GL_UNSIGNED_BYTE, data);
-    glGenerateMipmap(GL_TEXTURE_2D);
+    pf_safe_generate_mipmap(GL_TEXTURE_2D);
 
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
@@ -442,7 +503,7 @@ void R_GL_Texture_ArrayAlloc(size_t num_elems, struct texture_arr *out, GLuint t
     glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
     glPixelStorei(GL_PACK_ALIGNMENT, 1);
 
-    glGenerateMipmap(GL_TEXTURE_2D_ARRAY);
+    pf_safe_generate_mipmap(GL_TEXTURE_2D_ARRAY);
     glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
     glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_WRAP_S, GL_REPEAT);
@@ -587,7 +648,7 @@ void R_GL_Texture_ArrayMake(const struct material *mats, size_t num_mats,
         PF_FREE(resized_data);
     }
 
-    glGenerateMipmap(GL_TEXTURE_2D_ARRAY);
+    pf_safe_generate_mipmap(GL_TEXTURE_2D_ARRAY);
     glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
     glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_WRAP_S, GL_REPEAT);
@@ -608,8 +669,28 @@ void R_GL_Texture_ArrayMakeMap(const char texnames[][256], size_t num_textures,
     glGenTextures(1, &out->id);
     glBindTexture(GL_TEXTURE_2D_ARRAY, out->id);
 
+#ifdef __ANDROID__
+    /* Directive B3: the map-texture slices are uploaded with GL_RGB +
+     * GL_UNSIGNED_BYTE below; GLES 3.2 only accepts that combination
+     * for a GL_RGB8 internal format (desktop GL was lenient and let
+     * GL_RGB slices land in a GL_RGBA8 array, which Adreno rejects as
+     * "pixel buffer format is not compatible with level format").
+     * GL_RGB8 yields the same sampled values as the desktop path
+     * (alpha reads back as 1). */
+    {
+        static int logged;
+        if(!logged) {
+            logged = 1;
+            printf("PF/GL: formato GL_RGBA8 sustituido por GL_RGB8\n");
+        }
+    }
+    glTexImage3D(GL_TEXTURE_2D_ARRAY, 0, GL_RGB8,
+        CONFIG_TILE_TEX_RES, CONFIG_TILE_TEX_RES, num_textures, 0,
+        GL_RGB, GL_UNSIGNED_BYTE, 0);
+#else
     glTexImage3D(GL_TEXTURE_2D_ARRAY, 0, GL_RGBA8, 
         CONFIG_TILE_TEX_RES, CONFIG_TILE_TEX_RES, num_textures, 0, GL_RGBA, GL_UNSIGNED_BYTE, 0);
+#endif
 
     glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
     glPixelStorei(GL_PACK_ALIGNMENT, 1);
@@ -647,7 +728,7 @@ void R_GL_Texture_ArrayMakeMap(const char texnames[][256], size_t num_textures,
         }
     }
 
-    glGenerateMipmap(GL_TEXTURE_2D_ARRAY);
+    pf_safe_generate_mipmap(GL_TEXTURE_2D_ARRAY);
     glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
     glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_WRAP_S, GL_REPEAT);
@@ -683,7 +764,7 @@ static bool wang_tileset_load_cached(const char *name, uint64_t tag, size_t tile
     glTexImage3D(GL_TEXTURE_2D_ARRAY, 0, GL_RGBA8, tileset_dim, tileset_dim,
         TILESET_NUM_TILES, 0, GL_RGBA, GL_UNSIGNED_BYTE, cached.pixels);
 
-    glGenerateMipmap(GL_TEXTURE_2D_ARRAY);
+    pf_safe_generate_mipmap(GL_TEXTURE_2D_ARRAY);
     glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
     glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
@@ -727,7 +808,7 @@ static void wang_tileset_store_cached(const char *name, uint64_t tag, size_t til
 
 static void array_set_params(void)
 {
-    glGenerateMipmap(GL_TEXTURE_2D_ARRAY);
+    pf_safe_generate_mipmap(GL_TEXTURE_2D_ARRAY);
     glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
     glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
