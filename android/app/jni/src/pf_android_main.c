@@ -224,6 +224,11 @@ framebuf_full:
     if(s_fatal_fd >= 0) {
         char snap[16384];
         size_t n = bb_dump(snap, sizeof(snap) - 2, 128);
+        /* Overwrite semantics + size cap: start from an empty file and
+         * issue a single bounded write, so the report never grows across
+         * runs (ftruncate/lseek/write are async-signal-safe). */
+        ftruncate(s_fatal_fd, 0);
+        lseek(s_fatal_fd, 0, SEEK_SET);
         ssize_t w1 = write(s_fatal_fd, snap, n);
         ssize_t w2 = write(s_fatal_fd, "\n", 1);
         (void)w1; (void)w2;
@@ -339,6 +344,61 @@ done:
     if(cls)
         (*env)->DeleteLocalRef(env, cls);
     (*env)->DeleteLocalRef(env, activity);
+}
+
+/* ---------------------------------------------------------------------------
+ * Boot marker: "arranque en curso" flag next to the report files. Created
+ * as the first action of SDL_main, cleared when the engine is already
+ * drawing frames (__wrap_SDL_GL_SwapWindow). A marker that survives a run
+ * means that run closed without completing the boot.
+ * ------------------------------------------------------------------------- */
+static const char *pf_marker_path(char *buf, size_t bufsz)
+{
+    const char *ext = SDL_AndroidGetExternalStoragePath();
+    if(!ext || !*ext)
+        return NULL;
+    snprintf(buf, bufsz, "%s/boot-in-progress.marker", ext);
+    return buf;
+}
+
+static void pf_write_boot_marker(void)
+{
+    char path[512];
+    if(!pf_marker_path(path, sizeof(path)))
+        return;
+    FILE *f = fopen(path, "w");
+    if(f) {
+        fprintf(f, "boot in progress\n");
+        fclose(f);
+    }
+}
+
+static void pf_clear_boot_marker(void)
+{
+    char path[512];
+    if(pf_marker_path(path, sizeof(path)))
+        unlink(path);
+}
+
+/* ---------------------------------------------------------------------------
+ * First-frame hook: the final link of libmain.so wraps SDL_GL_SwapWindow
+ * (Android.mk: -Wl,--wrap=SDL_GL_SwapWindow), so every present performed
+ * by the app — including the render thread's per-frame swap in
+ * render.c — lands here first. The first call proves the engine is
+ * already drawing frames: clear the boot marker, then delegate to the
+ * real SDL function. Engine sources stay untouched.
+ * ------------------------------------------------------------------------- */
+extern void __real_SDL_GL_SwapWindow(SDL_Window *window);
+
+void __wrap_SDL_GL_SwapWindow(SDL_Window *window)
+{
+    static int first_frame_seen;
+    if(!first_frame_seen) {
+        first_frame_seen = 1;
+        pf_clear_boot_marker();
+        SDL_Log("pf-android: first frame presented; boot marker cleared");
+    }
+    __real_SDL_GL_SwapWindow(window);
 }
 
 /* ---------------------------------------------------------------------------
@@ -528,19 +588,27 @@ int SDL_main(int argc, char *argv[])
     (void)argc;
     (void)argv;
 
+    /* First action: mark this run as "boot in progress". Cleared by the
+     * first presented frame (__wrap_SDL_GL_SwapWindow). If the run dies
+     * before any frame, the marker survives so the next launch can show
+     * the previous failure before the engine starts (PFActivity). */
+    pf_write_boot_marker();
+
     SDL_LogSetOutputFunction(pf_sdl_log_capture, NULL);
     pf_install_fatal_handlers();
     atexit(pf_atexit_report);
 
     /* Pre-open the fatal-signal report file before anything can crash.
-     * Append rather than truncate: a previous crash report must survive
-     * the next launch so it can be collected after the app closes. */
+     * Overwrite per run (O_TRUNC): only the latest report is kept — the
+     * previous one was already collected and archived by PFActivity
+     * before the engine started. Size stays capped at one bounded
+     * snapshot written by the handler (see pf_fatal_handler). */
     {
         const char *ext = SDL_AndroidGetExternalStoragePath();
         if(ext && *ext) {
             char path[512];
             snprintf(path, sizeof(path), "%s/boot-report-fatal.txt", ext);
-            s_fatal_fd = open(path, O_WRONLY | O_CREAT | O_APPEND, 0644);
+            s_fatal_fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
         }
     }
     pf_capture_stdio();

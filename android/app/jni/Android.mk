@@ -147,6 +147,12 @@ LOCAL_SHARED_LIBRARIES := SDL2
 
 LOCAL_LDLIBS := -lGLESv3 -lEGL -lOpenSLES -llog -landroid -lm -ldl -lz
 
+# Route every final-link call to SDL_GL_SwapWindow (per-frame present in
+# engine/src/render/render.c) through __wrap_SDL_GL_SwapWindow in
+# pf_android_main.c, which clears the boot-in-progress marker on the
+# first presented frame before delegating to the real SDL function.
+LOCAL_LDFLAGS := -Wl,--wrap=SDL_GL_SwapWindow
+
 include $(BUILD_SHARED_LIBRARY)
 
 # Build the vendored SDL2 shared library itself.
