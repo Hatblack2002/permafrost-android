@@ -17,6 +17,22 @@
 #include <EGL/egl.h>
 #include <stdbool.h>
 #include <string.h>
+#include <android/log.h>
+
+/* Directive A: one-line NULL guard log, so the next logcat names the
+ * exact runtime-resolved entry point that came back NULL. Defined
+ * before its first use (glBufferStorage below). */
+#define PF_GL_NULL_GUARD(real, fname)                                       \
+    do {                                                                    \
+        if(!(real)) {                                                       \
+            static int warned;                                              \
+            if(!warned) {                                                   \
+                warned = 1;                                                 \
+                __android_log_print(ANDROID_LOG_ERROR, "pf-gl",             \
+                                    "PF/GL NULL fn: " fname);               \
+            }                                                               \
+        }                                                                   \
+    } while(0)
 
 static PFNGLBUFFERSTORAGEEXTPROC s_pf_gl_buffer_storage;
 static int s_pf_gl_buffer_storage_resolved;
@@ -120,20 +136,6 @@ static void *pf_gl_resolve_core(const char *name)
     }
     return eglGetProcAddress(name);
 }
-
-/* Directive A: one-line NULL guard log, so the next logcat names the
- * exact runtime-resolved entry point that came back NULL. */
-#define PF_GL_NULL_GUARD(real, fname)                                       \
-    do {                                                                    \
-        if(!(real)) {                                                       \
-            static int warned;                                              \
-            if(!warned) {                                                   \
-                warned = 1;                                                 \
-                __android_log_print(ANDROID_LOG_ERROR, "pf-gl",             \
-                                    "PF/GL NULL fn: " fname);               \
-            }                                                               \
-        }                                                                   \
-    } while(0)
 
 /* ---- per-texture size tracking for the readback shims ------------- */
 #define PF_GL_TRACK_MAX 256
