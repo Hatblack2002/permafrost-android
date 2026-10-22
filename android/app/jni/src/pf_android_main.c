@@ -176,6 +176,11 @@ static void pf_capture_stdio(void)
  * ------------------------------------------------------------------------- */
 static int s_fatal_fd = -1; /* pre-opened report file, write() from handler */
 
+/* Set by the fatal handler AFTER the report file is written; the
+ * watchdog thread (pf_fatal_watchdog) wakes on it. sig_atomic_t + plain
+ * writes are the signal-safe way to publish the flag. */
+static volatile sig_atomic_t s_fatal_hit = 0;
+
 static void pf_fatal_handler(int sig, siginfo_t *si, void *uctx)
 {
     char framebuf[2048];
@@ -234,8 +239,14 @@ framebuf_full:
         (void)w1; (void)w2;
     }
 
-    signal(sig, SIG_DFL);
-    raise(sig);
+    /* Directive: do NOT re-raise and do NOT exit()/abort(). Park this
+     * thread forever: the process stays alive and the watchdog thread
+     * shows the report on screen (the handler itself cannot do JNI —
+     * it is not async-signal-safe). The user reads/copies the report
+     * and closes the app manually from the launcher. */
+    s_fatal_hit = sig;
+    for(;;)
+        sleep(1);
 }
 
 static void pf_install_fatal_handlers(void)
@@ -344,6 +355,24 @@ done:
     if(cls)
         (*env)->DeleteLocalRef(env, cls);
     (*env)->DeleteLocalRef(env, activity);
+}
+
+/* ---------------------------------------------------------------------------
+ * Fatal-report watchdog: puts the boot report on screen after a fatal
+ * signal. The handler parks the faulting thread (no re-raise, no exit)
+ * and publishes s_fatal_hit; this thread notices it and reuses the
+ * normal JNI report path, so the report stays readable and copiable
+ * until the user closes the app.
+ * ------------------------------------------------------------------------- */
+static int pf_fatal_watchdog(void *arg)
+{
+    (void)arg;
+    while(!s_fatal_hit)
+        SDL_Delay(200);
+    SDL_Delay(300); /* let the handler finish its report-file write */
+    /* 128+n: conventional exit code for a death by signal n. */
+    pf_show_report_on_screen(128 + (int)s_fatal_hit);
+    return 0;
 }
 
 /* ---------------------------------------------------------------------------
@@ -596,6 +625,7 @@ int SDL_main(int argc, char *argv[])
 
     SDL_LogSetOutputFunction(pf_sdl_log_capture, NULL);
     pf_install_fatal_handlers();
+    SDL_CreateThread(pf_fatal_watchdog, "pf-fatal-watchdog", NULL);
     atexit(pf_atexit_report);
 
     /* Pre-open the fatal-signal report file before anything can crash.
